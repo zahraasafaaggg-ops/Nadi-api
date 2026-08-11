@@ -2908,7 +2908,10 @@ class AnnouncementCanvas:
             raise ValueError("لا روايات")
 
         # ── حجم البطاقة حسب العدد ──
-        CARDS_PER_ROW = 4 if n > 4 else max(1, n)
+        if n <= 8:
+            CARDS_PER_ROW = 4
+        else:
+            CARDS_PER_ROW = 5
 
         if n == 1:
             cw, ch = 380, 560
@@ -3011,7 +3014,7 @@ class AnnouncementCanvas:
 		
 
 # ══════════════════════════════════════════════════════════════
-#  طابور الإعلانات — المنطق المحسّن (تم تعديل _get_upcoming_serial_times)
+#  طابور الإعلانات — المنطق المحسّن (تم تعديل _check_and_announce)
 # ══════════════════════════════════════════════════════════════
 
 class AnnouncementQueue:
@@ -3076,28 +3079,61 @@ class AnnouncementQueue:
             within_window = [t for t in upcoming if now < t <= window_end]
 
             if within_window:
-                # ينتظر حتى آخر جدول في النافذة + 90 ثانية هامش
+                # أحدث جدول في النافذة
                 latest       = max(within_window)
                 wait_seconds = (latest - now).total_seconds() + 90
+                if wait_seconds < 30:
+                    wait_seconds = 30
                 log.info(
-                    f"[Queue] ينتظر {len(within_window)} جدول تسلسلي ضمن النافذة. "
-                    f"آخرها: {latest.strftime('%H:%M')} بغداد. "
+                    f"[Queue] ينتظر حتى {latest.strftime('%H:%M')} (بغداد) لآخر جدول في النافذة. "
                     f"الانتظار: {wait_seconds/60:.1f} دقيقة"
                 )
                 # إلغاء مهمة إعادة الفحص القديمة إن وجدت
                 if self._pending_recheck and not self._pending_recheck.done():
                     self._pending_recheck.cancel()
                 self._pending_recheck = asyncio.create_task(
-                    self._delayed_recheck(wait_seconds)
+                    self._delayed_recheck(wait_seconds, window_end, latest)
                 )
             else:
                 # لا جداول قادمة ضمن النافذة → أعلن الآن
                 log.info(f"[Queue] لا جداول ضمن النافذة — إعلان فوري ({len(pending)} عنصر)")
                 await self._fire_announcement(pending)
 
-    async def _delayed_recheck(self, delay_seconds: float):
+    async def _delayed_recheck(self, delay_seconds: float, window_end: datetime, latest: datetime):
+        """يعيد الفحص كل 30 ثانية لاكتشاف جداول جديدة أحدث."""
+        db = db_client.get_database("rewyat_bot")
         try:
-            await asyncio.sleep(max(30, delay_seconds))
+            slept = 0
+            while slept < delay_seconds:
+                await asyncio.sleep(30)
+                slept += 30
+
+                now2 = datetime.now(BAGHDAD_TZ)
+                # تحقق من وجود جداول جديدة أحدث من latest
+                new_upcoming = []
+                async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
+                    published = doc.get("published_count", 0)
+                    total = doc.get("total_chapters", 0)
+                    if published >= total:
+                        continue
+                    h = doc.get("hour", 0)
+                    m = doc.get("minute", 0)
+                    candidate = now2.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if candidate <= now2:
+                        candidate += timedelta(days=1)
+                    if candidate <= window_end and candidate > latest:
+                        latest = candidate
+                        new_delay = (latest - now2).total_seconds() + 90
+                        if new_delay > delay_seconds - slept:
+                            extra = new_delay - (delay_seconds - slept)
+                            delay_seconds += extra
+                            log.info(
+                                f"[Queue] جدول جديد أحدث: {latest.strftime('%H:%M')} — "
+                                f"تمديد الانتظار {extra/60:.1f} دقيقة إضافية"
+                            )
+                            break  # الخروج من الحلقة الداخلية لإعادة حساب الوقت
+
+            # بعد انتهاء الانتظار، نجمع كل المعلقات ونعلن
             async with self._lock:
                 pending = await self.col.find({"announced": False}).to_list(length=100)
                 if pending:
@@ -3599,65 +3635,52 @@ class AnnouncementCog(commands.Cog):
         else:
             await ctx.send(embed=warn_embed("تم التخطي", "لم يُرفع أي غلاف."))
 
-    @commands.hybrid_command(name="تجربة_إعلان", description="معاينة كيف ستبدو صورة الإعلان")
+    @commands.hybrid_command(name="تجربة_إعلان", description="معاينة صورة الإعلان للروايات التسلسلية فقط")
     async def preview_announcement(self, ctx: commands.Context):
         if not self._is_owner(ctx.author.id):
             return await ctx.send(embed=err_embed("غير مصرح"), ephemeral=True)
         if not PILLOW_OK:
             return await ctx.send(embed=err_embed("Pillow غير مثبت", "قم بتشغيل: `pip install Pillow`"))
+
+        # جلب الجداول التسلسلية النشطة فقط
+        db = db_client.get_database("rewyat_bot")
+        schedules = await db.serial_schedules.find({"finished": False, "paused": False}).to_list(length=100)
+        if not schedules:
+            return await ctx.send(embed=warn_embed("لا توجد جداول تسلسلية نشطة"))
+
+        entries = []
+        for doc in schedules:
+            slug = doc["slug"]
+            cover = await self.get_cover(slug)
+            novel_arabic = doc.get("novel_arabic", slug)
+            published = doc.get("published_count", 0)
+            first = max(1, published - 5)
+            last = published if published > 0 else 1
+            entries.append({
+                "novel_arabic": novel_arabic,
+                "slug": slug,
+                "first_chapter": first,
+                "last_chapter": last,
+                "cover_bytes": cover,
+            })
+
+        if not entries:
+            return await ctx.send(embed=warn_embed("لا توجد بيانات كافية للمعاينة"))
+
         thinking = await ctx.send(embed=make_embed("جاري الرسم...", "يتم رسم الصورة التجريبية...", Colors.WARNING))
-        pending = await self.queue.get_pending_entries()
-
-        if pending:
-            entries = []
-            for p in pending:
-                cover = p.get("cover_bytes")
-                if not cover:
-                    cover = await self.get_cover(p.get("slug", ""))
-                entries.append({
-                    "novel_arabic":  p["novel_arabic"],
-                    "slug":          p.get("slug", ""),
-                    "first_chapter": p.get("first_chapter", p.get("last_chapter", 0)),
-                    "last_chapter":  p["last_chapter"],
-                    "cover_bytes":   cover,
-                })
-        else:
-            novels_doc = await self.db.config.find_one({"_id": "novels"})
-            novels = (novels_doc.get("data", {}).get("novels", []) if novels_doc else [])
-            entries = []
-            for n in novels[:8]:
-                cover = await self.get_cover(n["slug"])
-                pc = n.get("published_count", 0)
-                entries.append({
-                    "novel_arabic":  n["arabic"],
-                    "slug":          n["slug"],
-                    "first_chapter": max(1, pc - 5),
-                    "last_chapter":  pc,
-                    "cover_bytes":   cover,
-                })
-            if not entries:
-                entries = [
-                    {"novel_arabic": f"رواية تجريبية {i}", "slug": f"test-{i}",
-                     "first_chapter": i*10, "last_chapter": i*10+5, "cover_bytes": None}
-                    for i in range(1, 5)
-                ]
-
         try:
             canvas    = AnnouncementCanvas(entries)
             img_bytes = canvas.render()
             file      = discord.File(io.BytesIO(img_bytes), filename="preview.jpg")
             date_str  = datetime.now(BAGHDAD_TZ).strftime("%Y/%m/%d")
-            sources   = [p.get("source", "serial") for p in (pending or [{"source":"serial"}])]
-            src       = "serial" if "serial" in sources else sources[0]
-            text_prev = _build_announcement_text(entries[:2], src, date_str)
+            text_prev = _build_announcement_text(entries[:2], "serial", date_str)
             await thinking.delete()
             await ctx.send(
-                content=f"**معاينة النص:**\n```\n{text_prev[:500]}\n```",
+                content=f"**معاينة النص (للروايات التسلسلية النشطة):**\n```\n{text_prev[:500]}\n```",
                 file=file,
                 embed=make_embed(
-                    "معاينة الإعلان",
-                    f"هكذا ستبدو الصورة والنص.\n"
-                    f"{'بيانات معلقة حقيقية' if pending else 'بيانات تجريبية'}",
+                    "معاينة الإعلان — الروايات التسلسلية",
+                    f"هذه الصورة تمثل **{len(entries)}** رواية تسلسلية نشطة.",
                     Colors.PURPLE
                 )
             )
