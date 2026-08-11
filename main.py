@@ -9,6 +9,7 @@ import textwrap
 import math
 import unicodedata
 import urllib.request
+import gzip
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
 
@@ -21,6 +22,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 import motor.motor_asyncio
+from bson.binary import Binary
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -418,21 +420,15 @@ novel_store = None
 stats       = None
 scheduler   = AsyncIOScheduler(timezone="UTC")
 
-jobs_db     = {"jobs": []}
-serial_db   = {"schedules": []}
+jobs_db     = {"jobs": []}   # للمهام العادية (غير التسلسلية)
 
 async def save_jobs():
     global jobs_db
     await save_to_mongo(db_client.get_database("rewyat_bot").jobs, "jobs", jobs_db)
 
-async def save_serial():
-    global serial_db
-    await save_to_mongo(db_client.get_database("rewyat_bot").serial_schedules, "serial", serial_db)
-
-async def load_jobs_and_serial(jobs_col, serial_col):
-    global jobs_db, serial_db
+async def load_jobs(jobs_col):
+    global jobs_db
     jobs_db = await load_from_mongo(jobs_col, "jobs", {"jobs": []})
-    serial_db = await load_from_mongo(serial_col, "serial", {"schedules": []})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -513,11 +509,11 @@ class RewayatBot(commands.Bot):
             await save_jobs()
         log.info(f"استعادة المهام: {restored} نشطة، {expired} منتهية حُذفت")
 
+        # استعادة الجداول التسلسلية من MongoDB مباشرة
+        db = db_client.get_database("rewyat_bot")
         serial_restored = 0
-        for doc in serial_db.get("schedules", []):
-            if doc.get("finished") or doc.get("paused"):
-                continue
-            sid = doc["serial_id"]
+        async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
+            sid = doc["_id"]
             try:
                 scheduler.add_job(
                     run_serial_batch,
@@ -591,7 +587,7 @@ async def run_job(job: dict):
 
 
 # ══════════════════════════════════════════════════════════════
-#  نظام النشر التسلسلي اليومي
+#  نظام النشر التسلسلي اليومي (باستخدام MongoDB مباشرة)
 # ══════════════════════════════════════════════════════════════
 
 def _serial_bar(done: int, total: int, width: int = 14) -> str:
@@ -599,19 +595,11 @@ def _serial_bar(done: int, total: int, width: int = 14) -> str:
     filled = round(pct * width)
     return f"[{'█' * filled}{'░' * (width - filled)}] {round(pct * 100)}%"
 
-def _get_serial(sid: str) -> Optional[dict]:
-    return next((d for d in serial_db.get("schedules", []) if d["serial_id"] == sid), None)
-
-def _save_serial_field(sid: str, **kwargs):
-    for doc in serial_db.get("schedules", []):
-        if doc["serial_id"] == sid:
-            doc.update(kwargs)
-            asyncio.create_task(save_serial())
-            return
-
 
 async def run_serial_batch(serial_id: str):
-    doc = _get_serial(serial_id)
+    """تنفيذ دفعة النشر التسلسلي - تقرأ الجدول والفصول من MongoDB مباشرة."""
+    db = db_client.get_database("rewyat_bot")
+    doc = await db.serial_schedules.find_one({"_id": serial_id})
     if not doc:
         log.warning(f"[Serial] الجدول {serial_id} غير موجود، إلغاء المهمة.")
         try:
@@ -625,9 +613,8 @@ async def run_serial_batch(serial_id: str):
         return
 
     published_count = doc.get("published_count", 0)
-    chapters        = doc.get("chapters", [])
+    total           = doc.get("total_chapters", 0)
     batch_size      = doc.get("batch_size", 1)
-    total           = len(chapters)
 
     if published_count >= total:
         log.info(f"[Serial] انتهت فصول الجدول {serial_id}.")
@@ -635,7 +622,10 @@ async def run_serial_batch(serial_id: str):
             scheduler.remove_job(f"serial_{serial_id}")
         except Exception:
             pass
-        _save_serial_field(serial_id, finished=True)
+        await db.serial_schedules.update_one(
+            {"_id": serial_id},
+            {"$set": {"finished": True}}
+        )
         ch = bot.get_channel(doc["channel_id"])
         if ch:
             await ch.send(embed=make_embed(
@@ -646,10 +636,32 @@ async def run_serial_batch(serial_id: str):
             ))
         return
 
-    batch = chapters[published_count: published_count + batch_size]
+    # جلب الفصول التالية من serial_chapters
+    chapters_cursor = db.serial_chapters.find(
+        {"serial_id": serial_id, "number": {"$gt": published_count}}
+    ).sort("number", 1).limit(batch_size)
+    batch = []
+    async for ch in chapters_cursor:
+        # فك ضغط المحتوى
+        try:
+            content = gzip.decompress(ch["content_compressed"]).decode("utf-8")
+        except Exception:
+            content = ch.get("content", "")   # fallback (لن يكون موجوداً)
+        batch.append({
+            "number": ch["number"],
+            "title": ch["title"],
+            "content": content
+        })
+
+    if not batch:
+        # لا توجد فصول (ربما بسبب مشكلة في الفهرس)
+        log.warning(f"[Serial] لم يُعثر على فصول للجدول {serial_id} رغم published_count {published_count}")
+        return
+
     api   = NovelAPI()
     slug  = doc["slug"]
-    pub   = fail = 0
+    pub   = 0
+    fail  = 0
     first_published_num = None
     last_published_num  = None
 
@@ -668,11 +680,15 @@ async def run_serial_batch(serial_id: str):
             account_manager.record_publish(False)
         await asyncio.sleep(1.0)
 
-    novel_store.inc_published(slug, pub)
-    new_count = published_count + len(batch)
-    _save_serial_field(serial_id, published_count=new_count)
+    # تحديث عدد المنشورات بعدد الناجحين فقط (باستخدام $inc)
+    if pub > 0:
+        await db.serial_schedules.update_one(
+            {"_id": serial_id},
+            {"$inc": {"published_count": pub}}
+        )
+        novel_store.inc_published(slug, pub)
 
-    # announce_enabled: True بشكل افتراضي، False إذا أراد المستخدم النشر بدون إعلان
+    # إرسال إعلان إذا طلب ذلك وتم نشر شيء
     if pub > 0 and ann_queue is not None and last_published_num is not None and doc.get("announce_enabled", True):
         cover = await ann_cog.get_cover(slug) if ann_cog else None
         await ann_queue.register_publish(
@@ -684,9 +700,12 @@ async def run_serial_batch(serial_id: str):
             source="serial",
         )
 
-    remaining    = total - new_count
+    # جلب القيم المحدثة لإرسال التقرير
+    doc_updated = await db.serial_schedules.find_one({"_id": serial_id})
+    new_count = doc_updated.get("published_count", published_count) if doc_updated else published_count
+    remaining = total - new_count
     batches_left = max(0, (remaining + batch_size - 1) // batch_size)
-    channel      = bot.get_channel(doc["channel_id"])
+    channel = bot.get_channel(doc["channel_id"])
     if channel:
         nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
         embed = make_embed(
@@ -1446,7 +1465,7 @@ class BatchConfirmView(discord.ui.View):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Views النشر التسلسلي
+#  Views النشر التسلسلي (تم تعديلها لتستخدم MongoDB مباشرة)
 # ══════════════════════════════════════════════════════════════
 
 class DailyTimePickerView(discord.ui.View):
@@ -1558,7 +1577,7 @@ class SerialChaptersPreviewView(discord.ui.View):
             lines.append(f"{icon} **{ch['number']}** — {str(ch.get('title',''))[:45]}")
         embed.add_field(name=f"الفصول (صفحة {self.page+1}/{self.total_pages})",
                         value="\n".join(lines) if lines else "—", inline=False)
-        embed.set_footer(text=f"ID: {doc['serial_id'][:14]}... | روايات Bot v{VERSION}")
+        embed.set_footer(text=f"ID: {doc['_id'][:14]}... | روايات Bot v{VERSION}")
         return embed
 
     def _refresh_buttons(self):
@@ -1585,6 +1604,7 @@ class SerialChaptersPreviewView(discord.ui.View):
 
 
 class SerialActionView(discord.ui.View):
+    """عرض لإدارة جدول تسلسلي واحد (يستلم doc من MongoDB)"""
     def __init__(self, doc: dict, uid: int):
         super().__init__(timeout=90)
         self.doc = doc; self.uid = uid
@@ -1634,15 +1654,23 @@ class SerialActionView(discord.ui.View):
 
     async def _preview(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        chapters = self.doc.get("chapters", [])
+        # جلب الفصول من serial_chapters (بدون المحتوى)
+        db = db_client.get_database("rewyat_bot")
+        chapters_cursor = db.serial_chapters.find(
+            {"serial_id": self.doc["_id"]},
+            {"content_compressed": 0}   # استبعاد المحتوى لتخفيف الحجم
+        ).sort("number", 1)
+        chapters = await chapters_cursor.to_list(length=10000)
         view = SerialChaptersPreviewView(chapters, self.doc, self.uid)
         view._refresh_buttons()
         await i.response.send_message(embed=view._build_embed(), view=view, ephemeral=True)
 
     async def _pause(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        sid = self.doc["serial_id"]
-        _save_serial_field(sid, paused=True); self.doc["paused"] = True
+        sid = self.doc["_id"]
+        db = db_client.get_database("rewyat_bot")
+        await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": True}})
+        self.doc["paused"] = True
         try: scheduler.pause_job(f"serial_{sid}")
         except Exception: pass
         self._build()
@@ -1650,8 +1678,10 @@ class SerialActionView(discord.ui.View):
 
     async def _resume(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        sid = self.doc["serial_id"]
-        _save_serial_field(sid, paused=False); self.doc["paused"] = False
+        sid = self.doc["_id"]
+        db = db_client.get_database("rewyat_bot")
+        await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": False}})
+        self.doc["paused"] = False
         try:
             scheduler.resume_job(f"serial_{sid}")
         except Exception:
@@ -1665,9 +1695,11 @@ class SerialActionView(discord.ui.View):
 
     async def _delete(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        sid = self.doc["serial_id"]
-        serial_db["schedules"] = [d for d in serial_db.get("schedules", []) if d["serial_id"] != sid]
-        await save_serial()
+        sid = self.doc["_id"]
+        db = db_client.get_database("rewyat_bot")
+        # حذف الجدول وجميع فصوله
+        await db.serial_schedules.delete_one({"_id": sid})
+        await db.serial_chapters.delete_many({"serial_id": sid})
         try: scheduler.remove_job(f"serial_{sid}")
         except Exception: pass
         self.clear_items()
@@ -1675,6 +1707,16 @@ class SerialActionView(discord.ui.View):
             embed=ok_embed("تم الحذف", f"تم حذف جدول **{self.doc.get('novel_arabic','الرواية')}** بنجاح."),
             view=None
         ); self.stop()
+
+    async def _toggle_announce(self, i: discord.Interaction):
+        if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        new_val = not self.doc.get("announce_enabled", True)
+        sid = self.doc["_id"]
+        db = db_client.get_database("rewyat_bot")
+        await db.serial_schedules.update_one({"_id": sid}, {"$set": {"announce_enabled": new_val}})
+        self.doc["announce_enabled"] = new_val
+        self._build()
+        await i.response.edit_message(embed=self._detail_embed(), view=self)
 
 
 class SerialListView(discord.ui.View):
@@ -1685,7 +1727,7 @@ class SerialListView(discord.ui.View):
             options = [
                 discord.SelectOption(
                     label=f"{d.get('novel_arabic','?')[:40]} — {d.get('batch_size',1)} فصل/يوم",
-                    value=d["serial_id"],
+                    value=d["_id"],
                     description=f"{'متوقف' if d.get('paused') else ('مكتمل' if d.get('finished') else 'نشط')} {d.get('published_count',0)}/{d.get('total_chapters',0)} فصل",
                     emoji="📖"
                 ) for d in docs[:25]
@@ -1695,14 +1737,14 @@ class SerialListView(discord.ui.View):
 
     async def _on_select(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        sid = i.data["values"][0]; doc = next((d for d in self.docs if d["serial_id"] == sid), None)
+        sid = i.data["values"][0]; doc = next((d for d in self.docs if d["_id"] == sid), None)
         if not doc: return await i.response.send_message(embed=err_embed("غير موجود"), ephemeral=True)
         action_view = SerialActionView(doc, self.uid)
         await i.response.send_message(embed=action_view._detail_embed(), view=action_view, ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════
-#  معالج النشر التسلسلي (SerialPublisher)
+#  معالج النشر التسلسلي (SerialPublisher) — تم تعديل حفظ الفصول
 # ══════════════════════════════════════════════════════════════
 
 class SerialPublisher:
@@ -1715,7 +1757,7 @@ class SerialPublisher:
         self.batch_size:      int            = 1
         self.hour24:          int            = 10
         self.minute:          int            = 0
-        self.announce_enabled: bool          = True   # الإعلان التلقائي مفعّل بشكل افتراضي
+        self.announce_enabled: bool          = True
 
     async def run(self):
         try:
@@ -1724,7 +1766,7 @@ class SerialPublisher:
             await self._step_extract_chapters()
             await self._step_batch_size()
             await self._step_daily_time()
-            await self._step_announce_option()    # ← خطوة جديدة
+            await self._step_announce_option()
             await self._step_preview_confirm()
             await self._step_create_schedule()
         except asyncio.TimeoutError:
@@ -1862,7 +1904,6 @@ class SerialPublisher:
         self.minute = time_view.minute
 
     async def _step_announce_option(self):
-        """خطوة 4.5 — هل يُرسل البوت إعلاناً تلقائياً بعد النشر؟"""
         novel_nm = self.novel["arabic"] if self.novel else self.slug
         view = discord.ui.View(timeout=60)
         chosen = {}
@@ -1964,32 +2005,53 @@ class SerialPublisher:
             raise asyncio.TimeoutError()
 
     async def _step_create_schedule(self):
+        """يحفظ الجدول والفصول في MongoDB مع ضغط المحتوى باستخدام gzip و Binary."""
         novel_nm = self.novel["arabic"] if self.novel else self.slug
         serial_id = f"serial_{self.interaction.user.id}_{int(datetime.utcnow().timestamp())}"
 
-        doc = {
-            "serial_id":        serial_id,
-            "slug":             self.slug,
-            "novel_arabic":     novel_nm,
-            "novel_english":    self.novel["english"] if self.novel else "",
-            "chapters":         self.chapters,
-            "total_chapters":   len(self.chapters),
-            "published_count":  0,
-            "batch_size":       self.batch_size,
-            "hour":             self.hour24,
-            "minute":           self.minute,
-            "channel_id":       self.interaction.channel_id,
-            "guild_id":         self.interaction.guild_id if self.interaction.guild else None,
-            "created_by":       self.interaction.user.id,
-            "paused":           False,
-            "finished":         False,
+        db = db_client.get_database("rewyat_bot")
+
+        # 1. حفظ الجدول الأساسي
+        schedule_doc = {
+            "_id": serial_id,
+            "slug": self.slug,
+            "novel_arabic": novel_nm,
+            "novel_english": self.novel["english"] if self.novel else "",
+            "batch_size": self.batch_size,
+            "total_chapters": len(self.chapters),
+            "published_count": 0,
+            "hour": self.hour24,
+            "minute": self.minute,
+            "channel_id": self.interaction.channel_id,
+            "guild_id": self.interaction.guild_id if self.interaction.guild else None,
+            "created_by": self.interaction.user.id,
+            "paused": False,
+            "finished": False,
             "announce_enabled": self.announce_enabled,
-            "created_at":       datetime.now(BAGHDAD_TZ).isoformat()
+            "created_at": datetime.now(BAGHDAD_TZ).isoformat()
         }
+        await db.serial_schedules.update_one(
+            {"_id": serial_id},
+            {"$set": schedule_doc},
+            upsert=True
+        )
 
-        serial_db.setdefault("schedules", []).append(doc)
-        await save_serial()
+        # 2. حفظ الفصول في serial_chapters مع ضغط المحتوى
+        chapters_col = db.serial_chapters
+        for ch in self.chapters:
+            compressed = gzip.compress(ch["content"].encode("utf-8"))
+            await chapters_col.update_one(
+                {"serial_id": serial_id, "number": ch["number"]},
+                {"$set": {
+                    "serial_id": serial_id,
+                    "number": ch["number"],
+                    "title": ch["title"],
+                    "content_compressed": Binary(compressed)
+                }},
+                upsert=True
+            )
 
+        # 3. جدولة المهمة
         scheduler.add_job(
             run_serial_batch,
             CronTrigger(hour=self.hour24, minute=self.minute, timezone=BAGHDAD_TZ),
@@ -2281,8 +2343,13 @@ async def cmd_stats(interaction: discord.Interaction):
     td = stats.today()
     up = datetime.now(BAGHDAD_TZ) - bot.start_time
     h, rem = divmod(int(up.total_seconds()), 3600); m = rem // 60
-    serial_active   = sum(1 for d in serial_db.get("schedules", []) if not d.get("paused") and not d.get("finished"))
-    serial_finished = sum(1 for d in serial_db.get("schedules", []) if d.get("finished"))
+
+    db = db_client.get_database("rewyat_bot")
+    # إحصائيات الجداول التسلسلية من MongoDB
+    serial_total = await db.serial_schedules.count_documents({})
+    serial_active = await db.serial_schedules.count_documents({"finished": False, "paused": False})
+    serial_finished = await db.serial_schedules.count_documents({"finished": True})
+
     await interaction.response.send_message(
         embed=make_embed("الإحصاءات", f"بوت النشر v{VERSION}", Colors.GOLD, fields=[
             {"name": "إجمالي المنشور",    "value": f"`{stats.total_published}` فصل", "inline": True},
@@ -2293,7 +2360,7 @@ async def cmd_stats(interaction: discord.Interaction):
             {"name": "مهام عادية نشطة",   "value": f"`{len(jobs_db['jobs'])}` مهمة", "inline": True},
             {"name": "الروايات",          "value": f"`{len(novel_store.novels)}`",    "inline": True},
             {"name": "وقت التشغيل",      "value": f"`{h}h {m}m`",                   "inline": True},
-            {"name": "جداول تسلسلية",    "value": f"نشطة: `{serial_active}` | مكتملة: `{serial_finished}`", "inline": False},
+            {"name": "جداول تسلسلية",    "value": f"نشطة: `{serial_active}` | مكتملة: `{serial_finished}` | الكل: `{serial_total}`", "inline": False},
         ])
     )
 
@@ -2349,7 +2416,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════════
-#  أوامر النشر التسلسلي
+#  أوامر النشر التسلسلي (تم تعديلها لاستخدام MongoDB مباشرة)
 # ══════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="نشر_تسلسلي", description="رفع رواية كاملة ونشر فصولها يومياً بشكل تلقائي")
@@ -2363,7 +2430,8 @@ async def cmd_serial_publish(interaction: discord.Interaction):
 @bot.tree.command(name="جداولي_التسلسلية", description="عرض وإدارة جداول النشر التسلسلي اليومي")
 @owner_only()
 async def cmd_list_serial_schedules(interaction: discord.Interaction):
-    docs = serial_db.get("schedules", [])
+    db = db_client.get_database("rewyat_bot")
+    docs = await db.serial_schedules.find({}).to_list(length=200)
     if not docs:
         await interaction.response.send_message(
             embed=make_embed(
@@ -2403,7 +2471,8 @@ async def cmd_list_serial_schedules(interaction: discord.Interaction):
 @bot.tree.command(name="معاينة_تسلسلي", description="معاينة فصول جدول نشر تسلسلي محدد")
 @owner_only()
 async def cmd_preview_serial(interaction: discord.Interaction):
-    docs = [d for d in serial_db.get("schedules", []) if not d.get("finished")]
+    db = db_client.get_database("rewyat_bot")
+    docs = await db.serial_schedules.find({"finished": False}).to_list(length=50)
     if not docs:
         await interaction.response.send_message(
             embed=make_embed("لا توجد جداول نشطة", "استخدم `/نشر_تسلسلي` لإنشاء جدول أولاً.", Colors.INFO)
@@ -2411,9 +2480,14 @@ async def cmd_preview_serial(interaction: discord.Interaction):
         return
 
     if len(docs) == 1:
-        doc      = docs[0]
-        chapters = doc.get("chapters", [])
-        view     = SerialChaptersPreviewView(chapters, doc, interaction.user.id)
+        doc = docs[0]
+        # جلب الفصول (بدون المحتوى)
+        chapters_cursor = db.serial_chapters.find(
+            {"serial_id": doc["_id"]},
+            {"content_compressed": 0}
+        ).sort("number", 1)
+        chapters = await chapters_cursor.to_list(length=10000)
+        view = SerialChaptersPreviewView(chapters, doc, interaction.user.id)
         view._refresh_buttons()
         await interaction.response.send_message(embed=view._build_embed(), view=view)
         return
@@ -2421,7 +2495,7 @@ async def cmd_preview_serial(interaction: discord.Interaction):
     options = [
         discord.SelectOption(
             label=f"{d.get('novel_arabic','?')[:50]}",
-            value=d["serial_id"],
+            value=d["_id"],
             description=f"{d.get('published_count',0)}/{d.get('total_chapters',0)} فصل منشور"
         )
         for d in docs[:25]
@@ -2432,12 +2506,16 @@ async def cmd_preview_serial(interaction: discord.Interaction):
     async def sel_cb(interaction_btn: discord.Interaction):
         if interaction_btn.user.id != interaction.user.id:
             return await interaction_btn.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        sid      = interaction_btn.data["values"][0]
-        doc      = next((d for d in docs if d["serial_id"] == sid), None)
+        sid = interaction_btn.data["values"][0]
+        doc = await db.serial_schedules.find_one({"_id": sid})
         if not doc:
             return await interaction_btn.response.send_message(embed=err_embed("غير موجود"), ephemeral=True)
-        chapters = doc.get("chapters", [])
-        pv       = SerialChaptersPreviewView(chapters, doc, interaction.user.id)
+        chapters_cursor = db.serial_chapters.find(
+            {"serial_id": sid},
+            {"content_compressed": 0}
+        ).sort("number", 1)
+        chapters = await chapters_cursor.to_list(length=10000)
+        pv = SerialChaptersPreviewView(chapters, doc, interaction.user.id)
         pv._refresh_buttons()
         await interaction_btn.response.send_message(embed=pv._build_embed(), view=pv, ephemeral=True)
 
@@ -2933,7 +3011,7 @@ class AnnouncementCanvas:
 		
 
 # ══════════════════════════════════════════════════════════════
-#  طابور الإعلانات — المنطق المحسّن
+#  طابور الإعلانات — المنطق المحسّن (تم تعديل _get_upcoming_serial_times)
 # ══════════════════════════════════════════════════════════════
 
 class AnnouncementQueue:
@@ -2994,7 +3072,7 @@ class AnnouncementQueue:
             # احسب الجداول التسلسلية القادمة ضمن النافذة
             now           = datetime.now(BAGHDAD_TZ)
             window_end    = now + timedelta(minutes=SERIAL_CLUSTER_WINDOW_MINUTES)
-            upcoming      = self._get_upcoming_serial_times(now)
+            upcoming      = await self._get_upcoming_serial_times(now)
             within_window = [t for t in upcoming if now < t <= window_end]
 
             if within_window:
@@ -3027,14 +3105,13 @@ class AnnouncementQueue:
         except asyncio.CancelledError:
             log.info("[Queue] مهمة إعادة الفحص أُلغيت (جدول جديد سيتولى)")
 
-    def _get_upcoming_serial_times(self, now: datetime) -> List[datetime]:
-        """يعيد أوقات الجداول التسلسلية النشطة القادمة خلال اليوم."""
+    async def _get_upcoming_serial_times(self, now: datetime) -> List[datetime]:
+        """يعيد أوقات الجداول التسلسلية النشطة القادمة خلال اليوم من MongoDB."""
+        db = db_client.get_database("rewyat_bot")
         upcoming = []
-        for doc in serial_db.get("schedules", []):
-            if doc.get("finished") or doc.get("paused"):
-                continue
+        async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
             published = doc.get("published_count", 0)
-            total     = len(doc.get("chapters", []))
+            total     = doc.get("total_chapters", 0)
             if published >= total:
                 continue
             h = doc.get("hour", 0); m = doc.get("minute", 0)
@@ -3634,7 +3711,7 @@ class AnnouncementCog(commands.Cog):
         tg_ok = "مُهيأ" if settings.get("telegram_bot_token") else "غير مُهيأ"
 
         now      = datetime.now(BAGHDAD_TZ)
-        upcoming = self.queue._get_upcoming_serial_times(now)
+        upcoming = await self.queue._get_upcoming_serial_times(now)
         window_end = now + timedelta(minutes=SERIAL_CLUSTER_WINDOW_MINUTES)
         within   = [t for t in upcoming if now < t <= window_end]
 
@@ -3719,11 +3796,19 @@ async def main():
         log.critical(f"فشل الاتصال بـ MongoDB: {e}")
         return
 
+    # إنشاء الفهارس المطلوبة
+    try:
+        await db.serial_schedules.create_index("finished")
+        await db.serial_schedules.create_index("paused")
+        await db.serial_chapters.create_index([("serial_id", 1), ("number", 1)], unique=True)
+        log.info("تم إنشاء الفهارس اللازمة")
+    except Exception as e:
+        log.warning(f"فشل إنشاء بعض الفهارس: {e}")
+
     config_col   = db.config
     jobs_col     = db.jobs
     stats_col    = db.stats
     accounts_col = db.accounts
-    serial_col   = db.serial_schedules
 
     novel_store = NovelStorage(config_col)
     await novel_store.initialize()
@@ -3734,7 +3819,7 @@ async def main():
     account_manager = AccountManager(accounts_col)
     await account_manager.initialize()
 
-    await load_jobs_and_serial(jobs_col, serial_col)
+    await load_jobs(jobs_col)
 
     await setup_announcement_system(bot, db)
     await bot.add_cog(ann_cog)
