@@ -10,6 +10,7 @@ import math
 import unicodedata
 import urllib.request
 import gzip
+import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
 
@@ -56,7 +57,7 @@ BASE_URL      = "https://rewayat.club/api"
 SITE_URL      = "https://rewayat.club"
 NOVEL_URL     = "https://rewayat.club/novel/{slug}"
 SEARCH_URL    = f"{BASE_URL}/novels/search/permitted/"
-VERSION = "4.6.0"
+VERSION = "4.7.0"
 
 # ── إضافة: خط Google (Amiri) يتم تحميله عند التشغيل ──
 ARABIC_FONT_URL = "https://fonts.gstatic.com/s/amiri/v27/J7aRnpd8CGxBHqUpsjIw7w.ttf"
@@ -66,6 +67,12 @@ ARABIC_FONT_BYTES = None   # سيُخزن هنا بعد التحميل
 ARABIC_FONT_PATH = "/usr/share/fonts/opentype/unifont/unifont.otf"
 # فاصل وقت الانتظار بين الجداول التسلسلية المتقاربة (دقيقة)
 SERIAL_CLUSTER_WINDOW_MINUTES = 120
+
+# ── إعدادات إعادة المحاولة ──
+MAX_RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2  # ثواني
+PUBLISH_SLEEP = 2     # ثواني بين الفصول
+FAILED_CHAPTERS_COLLECTION = "failed_chapters"
 
 # ══════════════════════════════════════════════════════════════
 #  ملصق تيليجرام
@@ -288,7 +295,7 @@ class NovelAPI:
     def _headers(self) -> dict:
         return {
             "Authorization": f"Token {account_manager.active_token}",
-            "User-Agent": "RewayatBot/4.6"
+            "User-Agent": "RewayatBot/4.7"
         }
 
     async def search(self, query: str) -> List[dict]:
@@ -311,11 +318,11 @@ class NovelAPI:
             form.add_field("number",  str(number))
             form.add_field("title",   chap_title)
             form.add_field("content", content)
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.post(url, headers=self._headers, data=form) as r:
                     text = await r.text()
-                    ok   = r.status in (200, 201)
+                    ok   = r.status in (200, 201, 202, 204)
                     if not ok:
                         log.warning(f"نشر فشل [{r.status}]: {text[:200]}")
                     return ok, text[:300]
@@ -596,6 +603,33 @@ def _serial_bar(done: int, total: int, width: int = 14) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {round(pct * 100)}%"
 
 
+async def _publish_with_retry(slug: str, number: int, title: str, content: str, api: NovelAPI, channel, progress_msg, idx, total) -> Tuple[bool, int]:
+    """محاولة نشر فصل مع إعادة المحاولة حتى 5 مرات."""
+    attempt = 0
+    while attempt < MAX_RETRY_ATTEMPTS:
+        ok, _ = await api.publish(slug, number, title, content)
+        if ok:
+            return True, attempt + 1
+        attempt += 1
+        if attempt < MAX_RETRY_ATTEMPTS:
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            await asyncio.sleep(delay)
+            # تحديث رسالة التقدم
+            if channel and progress_msg:
+                try:
+                    await progress_msg.edit(
+                        embed=make_embed(
+                            f"🔄 جاري إعادة المحاولة {attempt}/{MAX_RETRY_ATTEMPTS}",
+                            f"**الرواية:** {slug}\n**الفصل {number}:** {title}\n"
+                            f"المحاولة {attempt+1}/{MAX_RETRY_ATTEMPTS} بعد {delay:.1f} ثانية...",
+                            Colors.WARNING
+                        )
+                    )
+                except:
+                    pass
+    return False, MAX_RETRY_ATTEMPTS
+
+
 async def run_serial_batch(serial_id: str):
     """تنفيذ دفعة النشر التسلسلي - تقرأ الجدول والفصول من MongoDB مباشرة."""
     db = db_client.get_database("rewyat_bot")
@@ -642,11 +676,10 @@ async def run_serial_batch(serial_id: str):
     ).sort("number", 1).limit(batch_size)
     batch = []
     async for ch in chapters_cursor:
-        # فك ضغط المحتوى
         try:
             content = gzip.decompress(ch["content_compressed"]).decode("utf-8")
         except Exception:
-            content = ch.get("content", "")   # fallback (لن يكون موجوداً)
+            content = ch.get("content", "")
         batch.append({
             "number": ch["number"],
             "title": ch["title"],
@@ -654,7 +687,6 @@ async def run_serial_batch(serial_id: str):
         })
 
     if not batch:
-        # لا توجد فصول (ربما بسبب مشكلة في الفهرس)
         log.warning(f"[Serial] لم يُعثر على فصول للجدول {serial_id} رغم published_count {published_count}")
         return
 
@@ -664,9 +696,42 @@ async def run_serial_batch(serial_id: str):
     fail  = 0
     first_published_num = None
     last_published_num  = None
+    failed_chapters = []  # لتخزين الفصول الفاشلة
 
-    for ch_data in batch:
-        ok, _ = await api.publish(slug, ch_data["number"], ch_data["title"], ch_data["content"])
+    channel = bot.get_channel(doc["channel_id"])
+    progress_msg = None
+
+    # إرسال رسالة بدء النشر
+    if channel:
+        progress_msg = await channel.send(
+            embed=make_embed(
+                f"📚 بدء نشر دفعة — {doc.get('novel_arabic', slug)}",
+                f"جاري نشر {len(batch)} فصل...\n0/{len(batch)}",
+                Colors.INFO
+            )
+        )
+
+    for idx, ch_data in enumerate(batch, 1):
+        # تحديث رسالة التقدم
+        if channel and progress_msg:
+            try:
+                await progress_msg.edit(
+                    embed=make_embed(
+                        f"📖 جاري نشر الفصل {ch_data['number']} — {doc.get('novel_arabic', slug)}",
+                        f"**الفصل {ch_data['number']}:** {ch_data['title']}\n"
+                        f"التقدم: {idx}/{len(batch)}",
+                        Colors.INFO
+                    )
+                )
+            except:
+                pass
+
+        # محاولة النشر مع إعادة المحاولة
+        ok, attempts = await _publish_with_retry(
+            slug, ch_data["number"], ch_data["title"], ch_data["content"],
+            api, channel, progress_msg, idx, len(batch)
+        )
+
         if ok:
             pub += 1
             stats.record(True)
@@ -678,9 +743,44 @@ async def run_serial_batch(serial_id: str):
             fail += 1
             stats.record(False)
             account_manager.record_publish(False)
-        await asyncio.sleep(1.0)
+            # حفظ الفصل الفاشل في قاعدة البيانات
+            failed_chapters.append({
+                "slug": slug,
+                "number": ch_data["number"],
+                "title": ch_data["title"],
+                "content": ch_data["content"],
+                "serial_id": serial_id,
+                "failed_at": datetime.now(BAGHDAD_TZ).isoformat(),
+                "attempts": MAX_RETRY_ATTEMPTS
+            })
+            # تحديث رسالة التقدم بحالة الفشل
+            if channel and progress_msg:
+                try:
+                    await progress_msg.edit(
+                        embed=make_embed(
+                            f"❌ فشل الفصل {ch_data['number']} بعد {MAX_RETRY_ATTEMPTS} محاولات",
+                            f"**الرواية:** {doc.get('novel_arabic', slug)}\n"
+                            f"**الفصل {ch_data['number']}:** {ch_data['title']}\n"
+                            f"سيتم حفظ الفصل لإعادة المحاولة لاحقاً.",
+                            Colors.ERROR
+                        )
+                    )
+                except:
+                    pass
 
-    # تحديث عدد المنشورات بعدد الناجحين فقط (باستخدام $inc)
+        await asyncio.sleep(PUBLISH_SLEEP)
+
+    # حفظ الفصول الفاشلة في قاعدة البيانات
+    if failed_chapters:
+        failed_col = db[FAILED_CHAPTERS_COLLECTION]
+        for fc in failed_chapters:
+            await failed_col.update_one(
+                {"slug": fc["slug"], "number": fc["number"], "serial_id": fc["serial_id"]},
+                {"$set": fc},
+                upsert=True
+            )
+
+    # تحديث عدد المنشورات
     if pub > 0:
         await db.serial_schedules.update_one(
             {"_id": serial_id},
@@ -700,23 +800,46 @@ async def run_serial_batch(serial_id: str):
             source="serial",
         )
 
-    # جلب القيم المحدثة لإرسال التقرير
+    # إرسال تقرير نهائي
     doc_updated = await db.serial_schedules.find_one({"_id": serial_id})
     new_count = doc_updated.get("published_count", published_count) if doc_updated else published_count
     remaining = total - new_count
     batches_left = max(0, (remaining + batch_size - 1) // batch_size)
-    channel = bot.get_channel(doc["channel_id"])
-    if channel:
+
+    if channel and progress_msg:
         nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
         embed = make_embed(
-            f"دفعة جديدة — {doc.get('novel_arabic','')}",
+            f"✅ دفعة جديدة — {doc.get('novel_arabic','')}",
             f"تم نشر الفصول: {nums_str}\n\n"
             f"`{_serial_bar(new_count, total)}`\n\n"
             f"المنشور: {new_count}/{total}  |  المتبقي: {remaining}  |  دفعات باقية: {batches_left}",
             Colors.SUCCESS if fail == 0 else Colors.WARNING
         )
         if fail > 0:
-            embed.add_field(name="تنبيه", value=f"فشل نشر {fail} فصل من الدفعة.", inline=False)
+            failed_nums = ", ".join(str(fc["number"]) for fc in failed_chapters)
+            embed.add_field(
+                name=f"⚠️ فصول فاشلة ({fail})",
+                value=f"الفصول: {failed_nums}\nتم حفظها لإعادة المحاولة لاحقاً.\nاستخدم `/فصول_فاشلة` لعرضها.",
+                inline=False
+            )
+        await progress_msg.edit(embed=embed)
+    elif channel:
+        # إذا لم يكن هناك progress_msg (نادراً) نرسل رسالة جديدة
+        nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
+        embed = make_embed(
+            f"✅ دفعة جديدة — {doc.get('novel_arabic','')}",
+            f"تم نشر الفصول: {nums_str}\n\n"
+            f"`{_serial_bar(new_count, total)}`\n\n"
+            f"المنشور: {new_count}/{total}  |  المتبقي: {remaining}  |  دفعات باقية: {batches_left}",
+            Colors.SUCCESS if fail == 0 else Colors.WARNING
+        )
+        if fail > 0:
+            failed_nums = ", ".join(str(fc["number"]) for fc in failed_chapters)
+            embed.add_field(
+                name=f"⚠️ فصول فاشلة ({fail})",
+                value=f"الفصول: {failed_nums}\nتم حفظها لإعادة المحاولة لاحقاً.",
+                inline=False
+            )
         await channel.send(embed=embed)
 
     log.info(f"[Serial] دفعة {serial_id}: نُشر {pub}، فشل {fail} | متبقٍ: {remaining}")
@@ -2349,6 +2472,9 @@ async def cmd_stats(interaction: discord.Interaction):
     serial_total = await db.serial_schedules.count_documents({})
     serial_active = await db.serial_schedules.count_documents({"finished": False, "paused": False})
     serial_finished = await db.serial_schedules.count_documents({"finished": True})
+    
+    # إحصائيات الفصول الفاشلة
+    failed_count = await db.failed_chapters.count_documents({})
 
     await interaction.response.send_message(
         embed=make_embed("الإحصاءات", f"بوت النشر v{VERSION}", Colors.GOLD, fields=[
@@ -2361,6 +2487,7 @@ async def cmd_stats(interaction: discord.Interaction):
             {"name": "الروايات",          "value": f"`{len(novel_store.novels)}`",    "inline": True},
             {"name": "وقت التشغيل",      "value": f"`{h}h {m}m`",                   "inline": True},
             {"name": "جداول تسلسلية",    "value": f"نشطة: `{serial_active}` | مكتملة: `{serial_finished}` | الكل: `{serial_total}`", "inline": False},
+            {"name": "فصول فاشلة",       "value": f"`{failed_count}` فصل في قائمة الانتظار لإعادة المحاولة\nاستخدم `/فصول_فاشلة` لعرضها", "inline": False},
         ])
     )
 
@@ -2403,13 +2530,15 @@ async def cmd_help(interaction: discord.Interaction):
             {"name": "الجدولة",           "value": "`/جدولة_فصل` `/مهامي` `/إلغاء_مهمة`",         "inline": False},
             {"name": "الحسابات",          "value": "`/اضافة_حساب` `/حساباتي` `/تبديل_حساب`",     "inline": False},
             {"name": "النشر التسلسلي",   "value": "`/نشر_تسلسلي` `/جداولي_التسلسلية` `/معاينة_تسلسلي`", "inline": False},
+            {"name": "الفصول الفاشلة",   "value": "`/فصول_فاشلة` `/اعادة_نشر_فصل` `/اعادة_نشر_كل_فصول_رواية` `/اعادة_نشر_كل_الفصول`", "inline": False},
             {"name": "أخرى",             "value": "`/إحصاءات` `/مساعدة`",                         "inline": False},
             {"name": "ملاحظات",
              "value": (
                  "جدولة الفصل: اختر السنة، الشهر، اليوم، الساعة والدقيقة.\n"
                  "التسلسلي: ارفع ZIP كامل للرواية، حدد الدفعة والوقت اليومي.\n"
                  "ZIP: سمِّ الملفات 1.txt, 2.txt ...\n"
-                 "البوت يعمل بتوقيت العراق (Asia/Baghdad)."
+                 "البوت يعمل بتوقيت العراق (Asia/Baghdad).\n"
+                 "الفصول الفاشلة تُحفظ تلقائياً ويمكن إعادة نشرها يدوياً."
              ), "inline": False},
         ])
     )
@@ -2525,6 +2654,190 @@ async def cmd_preview_serial(interaction: discord.Interaction):
         embed=make_embed("اختر الجدول للمعاينة", color=Colors.PURPLE),
         view=sel_view
     )
+
+
+# ══════════════════════════════════════════════════════════════
+#  أوامر الفصول الفاشلة
+# ══════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="فصول_فاشلة", description="عرض الفصول التي فشل نشرها")
+@owner_only()
+async def cmd_failed_chapters(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_chapters.find({}).to_list(length=100)
+    if not failed:
+        await interaction.response.send_message(
+            embed=inf_embed("لا توجد فصول فاشلة", "جميع الفصول نُشرت بنجاح.")
+        )
+        return
+
+    # تجميع حسب الرواية
+    grouped = {}
+    for fc in failed:
+        slug = fc["slug"]
+        if slug not in grouped:
+            grouped[slug] = []
+        grouped[slug].append(fc)
+
+    embed = make_embed(f"📋 الفصول الفاشلة ({len(failed)})", color=Colors.WARNING)
+    desc_lines = []
+    for slug, chapters in grouped.items():
+        novel = novel_store.get_novel(slug)
+        novel_name = novel["arabic"] if novel else slug
+        nums = sorted(ch["number"] for ch in chapters)
+        nums_str = ", ".join(str(n) for n in nums[:10])
+        if len(nums) > 10:
+            nums_str += f" ... و {len(nums)-10} أخرى"
+        desc_lines.append(f"**{novel_name}** ({len(nums)} فصل): {nums_str}")
+    embed.description = "\n".join(desc_lines)
+    embed.set_footer(text="استخدم /اعادة_نشر_فصل أو /اعادة_نشر_كل_فصول_رواية لإعادة النشر")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="اعادة_نشر_فصل", description="إعادة نشر فصل فاشل محدد")
+@owner_only()
+async def cmd_retry_chapter(interaction: discord.Interaction, slug: str, number: int):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_chapters.find_one({"slug": slug, "number": number})
+    if not failed:
+        await interaction.response.send_message(
+            embed=err_embed("الفصل غير موجود", f"لا يوجد فصل فاشل برقم {number} للرواية `{slug}`")
+        )
+        return
+
+    novel = novel_store.get_novel(slug)
+    novel_name = novel["arabic"] if novel else slug
+
+    await interaction.response.defer()
+    api = NovelAPI()
+    ok, msg = await api.publish(slug, number, failed["title"], failed["content"])
+    
+    if ok:
+        stats.record(True)
+        account_manager.record_publish(True)
+        novel_store.inc_published(slug, 1)
+        await db.failed_chapters.delete_one({"_id": failed["_id"]})
+        # إعلان
+        if ann_queue is not None:
+            cover = await ann_cog.get_cover(slug) if ann_cog else None
+            await ann_queue.register_publish(
+                novel_arabic=novel_name,
+                slug=slug,
+                first_chapter=number,
+                last_chapter=number,
+                cover_bytes=cover,
+                source="manual",
+            )
+        await interaction.followup.send(
+            embed=ok_embed("تم نشر الفصل بنجاح", f"**{novel_name}**\nالفصل {number}: {failed['title']}")
+        )
+    else:
+        # زيادة عدد المحاولات
+        await db.failed_chapters.update_one(
+            {"_id": failed["_id"]},
+            {"$inc": {"attempts": 1}, "$set": {"last_retry": datetime.now(BAGHDAD_TZ).isoformat()}}
+        )
+        await interaction.followup.send(
+            embed=err_embed("فشل إعادة النشر", f"**{novel_name}**\nالفصل {number}: {failed['title']}\n```{msg[:400]}```")
+        )
+
+
+@bot.tree.command(name="اعادة_نشر_كل_فصول_رواية", description="إعادة نشر جميع الفصول الفاشلة لرواية معينة")
+@owner_only()
+async def cmd_retry_novel_failed(interaction: discord.Interaction, slug: str):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_chapters.find({"slug": slug}).to_list(length=100)
+    if not failed:
+        await interaction.response.send_message(
+            embed=err_embed("لا توجد فصول فاشلة", f"الرواية `{slug}` ليس لديها فصول فاشلة.")
+        )
+        return
+
+    novel = novel_store.get_novel(slug)
+    novel_name = novel["arabic"] if novel else slug
+
+    await interaction.response.defer()
+    api = NovelAPI()
+    pub = 0
+    fail = 0
+    for fc in failed:
+        ok, _ = await api.publish(slug, fc["number"], fc["title"], fc["content"])
+        if ok:
+            pub += 1
+            stats.record(True)
+            account_manager.record_publish(True)
+            novel_store.inc_published(slug, 1)
+            await db.failed_chapters.delete_one({"_id": fc["_id"]})
+        else:
+            fail += 1
+            stats.record(False)
+            account_manager.record_publish(False)
+            await db.failed_chapters.update_one(
+                {"_id": fc["_id"]},
+                {"$inc": {"attempts": 1}, "$set": {"last_retry": datetime.now(BAGHDAD_TZ).isoformat()}}
+            )
+        await asyncio.sleep(PUBLISH_SLEEP)
+
+    embed = make_embed(
+        f"إعادة نشر فصول {novel_name}",
+        f"تم: {pub} | فشل: {fail}",
+        Colors.SUCCESS if fail == 0 else Colors.WARNING
+    )
+    if pub > 0 and ann_queue is not None:
+        # إعلان واحد عن جميع الفصول المنشورة
+        first = min(fc["number"] for fc in failed if fc["number"] not in [f["number"] for f in failed if not ok]) # مبسط
+        last = max(fc["number"] for fc in failed if fc["number"] not in [f["number"] for f in failed if not ok])
+        cover = await ann_cog.get_cover(slug) if ann_cog else None
+        await ann_queue.register_publish(
+            novel_arabic=novel_name,
+            slug=slug,
+            first_chapter=first,
+            last_chapter=last,
+            cover_bytes=cover,
+            source="manual",
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="اعادة_نشر_كل_الفصول", description="إعادة نشر جميع الفصول الفاشلة في النظام")
+@owner_only()
+async def cmd_retry_all_failed(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_chapters.find({}).to_list(length=500)
+    if not failed:
+        await interaction.response.send_message(
+            embed=inf_embed("لا توجد فصول فاشلة", "جميع الفصول نُشرت بنجاح.")
+        )
+        return
+
+    await interaction.response.defer()
+    api = NovelAPI()
+    pub = 0
+    fail = 0
+    for fc in failed:
+        ok, _ = await api.publish(fc["slug"], fc["number"], fc["title"], fc["content"])
+        if ok:
+            pub += 1
+            stats.record(True)
+            account_manager.record_publish(True)
+            novel_store.inc_published(fc["slug"], 1)
+            await db.failed_chapters.delete_one({"_id": fc["_id"]})
+        else:
+            fail += 1
+            stats.record(False)
+            account_manager.record_publish(False)
+            await db.failed_chapters.update_one(
+                {"_id": fc["_id"]},
+                {"$inc": {"attempts": 1}, "$set": {"last_retry": datetime.now(BAGHDAD_TZ).isoformat()}}
+            )
+        await asyncio.sleep(PUBLISH_SLEEP)
+
+    embed = make_embed(
+        "إعادة نشر جميع الفصول الفاشلة",
+        f"تم: {pub} | فشل: {fail}",
+        Colors.SUCCESS if fail == 0 else Colors.WARNING
+    )
+    await interaction.followup.send(embed=embed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3824,6 +4137,8 @@ async def main():
         await db.serial_schedules.create_index("finished")
         await db.serial_schedules.create_index("paused")
         await db.serial_chapters.create_index([("serial_id", 1), ("number", 1)], unique=True)
+        await db.failed_chapters.create_index([("slug", 1), ("number", 1)])
+        await db.failed_chapters.create_index("serial_id")
         log.info("تم إنشاء الفهارس اللازمة")
     except Exception as e:
         log.warning(f"فشل إنشاء بعض الفهارس: {e}")
