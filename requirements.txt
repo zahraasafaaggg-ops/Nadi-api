@@ -1,0 +1,7 @@
+discord.py
+aiohttp
+apscheduler
+pytz
+motor
+Pillow
+python-dotenv
