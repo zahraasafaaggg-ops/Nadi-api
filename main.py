@@ -3327,7 +3327,7 @@ class AnnouncementCanvas:
 		
 
 # ══════════════════════════════════════════════════════════════
-#  طابور الإعلانات — المنطق المحسّن (تم تعديل _check_and_announce)
+#  طابور الإعلانات — المنطق المحسّن
 # ══════════════════════════════════════════════════════════════
 
 class AnnouncementQueue:
@@ -3336,10 +3336,10 @@ class AnnouncementQueue:
 
     قواعد الانتظار:
     - نشر منفرد / جماعي / مجدول → إعلان فوري (لا انتظار)
-    - نشر تسلسلي واحد انتهى → إعلان فوري
     - نشر تسلسلي + جداول أخرى ستنتهي خلال SERIAL_CLUSTER_WINDOW_MINUTES →
       ينتظر حتى آخر جدول في النافذة، ثم يُعلن الجميع معاً
     - إذا كان الجدول التالي بعد النافذة → يُعلن الموجودين فوراً
+    - ينتظر حتى تنتهي جميع الجداول ضمن النافذة من النشر، ثم يُعلن
     """
 
     def __init__(self, db_collection, bot: commands.Bot, settings_collection):
@@ -3413,17 +3413,18 @@ class AnnouncementQueue:
                 await self._fire_announcement(pending)
 
     async def _delayed_recheck(self, delay_seconds: float, window_end: datetime, latest: datetime):
-        """يعيد الفحص كل 30 ثانية لاكتشاف جداول جديدة أحدث."""
+        """يعيد الفحص كل 30 ثانية لاكتشاف جداول جديدة أحدث، ويتأكد من انتهاء جميع الجداول في النافذة."""
         db = db_client.get_database("rewyat_bot")
         try:
             slept = 0
+            # نتحقق أولاً من الجداول التي قد تكون ما زالت قيد النشر ضمن النافذة
             while slept < delay_seconds:
                 await asyncio.sleep(30)
                 slept += 30
 
                 now2 = datetime.now(BAGHDAD_TZ)
                 # تحقق من وجود جداول جديدة أحدث من latest
-                new_upcoming = []
+                new_latest = latest
                 async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
                     published = doc.get("published_count", 0)
                     total = doc.get("total_chapters", 0)
@@ -3434,22 +3435,51 @@ class AnnouncementQueue:
                     candidate = now2.replace(hour=h, minute=m, second=0, microsecond=0)
                     if candidate <= now2:
                         candidate += timedelta(days=1)
-                    if candidate <= window_end and candidate > latest:
-                        latest = candidate
-                        new_delay = (latest - now2).total_seconds() + 90
+                    # إذا كان الجدول ضمن النافذة ووقته أحدث من الأخير، نمدد الانتظار
+                    if candidate <= window_end and candidate > new_latest:
+                        new_latest = candidate
+                        new_delay = (new_latest - now2).total_seconds() + 90
                         if new_delay > delay_seconds - slept:
                             extra = new_delay - (delay_seconds - slept)
                             delay_seconds += extra
                             log.info(
-                                f"[Queue] جدول جديد أحدث: {latest.strftime('%H:%M')} — "
+                                f"[Queue] جدول جديد أحدث: {new_latest.strftime('%H:%M')} — "
                                 f"تمديد الانتظار {extra/60:.1f} دقيقة إضافية"
                             )
+                            latest = new_latest
                             break  # الخروج من الحلقة الداخلية لإعادة حساب الوقت
 
-            # بعد انتهاء الانتظار، نجمع كل المعلقات ونعلن
+                # بعد اكتشاف جدول أحدث، نكمل الحلقة الخارجية
+                if latest != new_latest:
+                    continue
+
+                # نتحقق مما إذا كانت جميع الجداول ضمن النافذة قد انتهت من النشر
+                all_finished = True
+                async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
+                    h = doc.get("hour", 0)
+                    m = doc.get("minute", 0)
+                    candidate = now2.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if candidate <= now2:
+                        candidate += timedelta(days=1)
+                    # إذا كان الجدول ضمن النافذة ولم ينتهِ بعد، نستمر في الانتظار
+                    if candidate <= window_end:
+                        published = doc.get("published_count", 0)
+                        total = doc.get("total_chapters", 0)
+                        if published < total:
+                            all_finished = False
+                            break
+
+                if all_finished:
+                    log.info("[Queue] جميع الجداول ضمن النافذة انتهت، سيتم الإعلان الآن.")
+                    break  # نخرج من حلقة الانتظار
+
+                # إذا لم نكسر الحلقة، نستمر في الانتظار حتى نهاية delay_seconds
+
+            # بعد انتهاء الانتظار (أو عند انتهاء جميع الجداول)، نجمع المعلقات ونعلن
             async with self._lock:
                 pending = await self.col.find({"announced": False}).to_list(length=100)
                 if pending:
+                    log.info(f"[Queue] إعلان بعد انتهاء الانتظار — {len(pending)} عنصر")
                     await self._fire_announcement(pending)
         except asyncio.CancelledError:
             log.info("[Queue] مهمة إعادة الفحص أُلغيت (جدول جديد سيتولى)")
