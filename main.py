@@ -57,7 +57,7 @@ BASE_URL      = "https://rewayat.club/api"
 SITE_URL      = "https://rewayat.club"
 NOVEL_URL     = "https://rewayat.club/novel/{slug}"
 SEARCH_URL    = f"{BASE_URL}/novels/search/permitted/"
-VERSION = "4.7.0"
+VERSION = "4.8.0"
 
 # ── إضافة: خط Google (Amiri) يتم تحميله عند التشغيل ──
 ARABIC_FONT_URL = "https://fonts.gstatic.com/s/amiri/v27/J7aRnpd8CGxBHqUpsjIw7w.ttf"
@@ -295,7 +295,7 @@ class NovelAPI:
     def _headers(self) -> dict:
         return {
             "Authorization": f"Token {account_manager.active_token}",
-            "User-Agent": "RewayatBot/4.7"
+            "User-Agent": "RewayatBot/4.8"
         }
 
     async def search(self, query: str) -> List[dict]:
@@ -522,13 +522,23 @@ class RewayatBot(commands.Bot):
         async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
             sid = doc["_id"]
             try:
+                # جدولة الموعد الأول
                 scheduler.add_job(
                     run_serial_batch,
                     CronTrigger(hour=doc["hour"], minute=doc["minute"], timezone=BAGHDAD_TZ),
-                    args=[sid],
-                    id=f"serial_{sid}",
+                    args=[sid, 0],
+                    id=f"serial_{sid}_0",
                     replace_existing=True
                 )
+                # إذا كان هناك موعد ثانٍ، جدوله
+                if doc.get("hour2") is not None and doc.get("minute2") is not None:
+                    scheduler.add_job(
+                        run_serial_batch,
+                        CronTrigger(hour=doc["hour2"], minute=doc["minute2"], timezone=BAGHDAD_TZ),
+                        args=[sid, 1],
+                        id=f"serial_{sid}_1",
+                        replace_existing=True
+                    )
                 serial_restored += 1
                 log.info(f"[Serial] استُعيد الجدول التسلسلي: {sid}")
             except Exception as e:
@@ -630,14 +640,17 @@ async def _publish_with_retry(slug: str, number: int, title: str, content: str, 
     return False, MAX_RETRY_ATTEMPTS
 
 
-async def run_serial_batch(serial_id: str):
-    """تنفيذ دفعة النشر التسلسلي - تقرأ الجدول والفصول من MongoDB مباشرة."""
+async def run_serial_batch(serial_id: str, time_index: int = 0):
+    """
+    تنفيذ دفعة النشر التسلسلي.
+    time_index: 0 للموعد الأول، 1 للموعد الثاني
+    """
     db = db_client.get_database("rewyat_bot")
     doc = await db.serial_schedules.find_one({"_id": serial_id})
     if not doc:
         log.warning(f"[Serial] الجدول {serial_id} غير موجود، إلغاء المهمة.")
         try:
-            scheduler.remove_job(f"serial_{serial_id}")
+            scheduler.remove_job(f"serial_{serial_id}_{time_index}")
         except Exception:
             pass
         return
@@ -649,31 +662,44 @@ async def run_serial_batch(serial_id: str):
     published_count = doc.get("published_count", 0)
     total           = doc.get("total_chapters", 0)
     batch_size      = doc.get("batch_size", 1)
+    # إذا كان هناك موعدان، نحدد عدد الفصول لكل موعد
+    if doc.get("hour2") is not None and doc.get("minute2") is not None:
+        # توزيع الفصول بالتساوي بين الموعدين (مع مراعاة الباقي)
+        half = batch_size // 2
+        if time_index == 0:
+            current_batch = half if batch_size % 2 == 0 else half + 1
+        else:
+            current_batch = half
+    else:
+        # موعد واحد فقط
+        current_batch = batch_size
 
     if published_count >= total:
         log.info(f"[Serial] انتهت فصول الجدول {serial_id}.")
         try:
-            scheduler.remove_job(f"serial_{serial_id}")
+            scheduler.remove_job(f"serial_{serial_id}_{time_index}")
         except Exception:
             pass
-        await db.serial_schedules.update_one(
-            {"_id": serial_id},
-            {"$set": {"finished": True}}
-        )
-        ch = bot.get_channel(doc["channel_id"])
-        if ch:
-            await ch.send(embed=make_embed(
-                "انتهت جميع فصول الجدول",
-                f"**{doc.get('novel_arabic','الرواية')}** — تم نشر جميع الـ {total} فصل بنجاح.\n"
-                f"يمكنك رفع رواية جديدة باستخدام `/نشر_تسلسلي`",
-                Colors.GOLD
-            ))
+        # نتحقق من انتهاء كلتا المهمتين
+        if doc.get("hour2") is None or (not scheduler.get_job(f"serial_{serial_id}_{1-time_index}")):
+            await db.serial_schedules.update_one(
+                {"_id": serial_id},
+                {"$set": {"finished": True}}
+            )
+            ch = bot.get_channel(doc["channel_id"])
+            if ch:
+                await ch.send(embed=make_embed(
+                    "انتهت جميع فصول الجدول",
+                    f"**{doc.get('novel_arabic','الرواية')}** — تم نشر جميع الـ {total} فصل بنجاح.\n"
+                    f"يمكنك رفع رواية جديدة باستخدام `/نشر_تسلسلي`",
+                    Colors.GOLD
+                ))
         return
 
     # جلب الفصول التالية من serial_chapters
     chapters_cursor = db.serial_chapters.find(
         {"serial_id": serial_id, "number": {"$gt": published_count}}
-    ).sort("number", 1).limit(batch_size)
+    ).sort("number", 1).limit(current_batch)
     batch = []
     async for ch in chapters_cursor:
         try:
@@ -696,16 +722,17 @@ async def run_serial_batch(serial_id: str):
     fail  = 0
     first_published_num = None
     last_published_num  = None
-    failed_chapters = []  # لتخزين الفصول الفاشلة
+    failed_chapters = []
 
     channel = bot.get_channel(doc["channel_id"])
     progress_msg = None
 
     # إرسال رسالة بدء النشر
+    time_str = f"الموعد {time_index+1}" if doc.get("hour2") is not None else ""
     if channel:
         progress_msg = await channel.send(
             embed=make_embed(
-                f"📚 بدء نشر دفعة — {doc.get('novel_arabic', slug)}",
+                f"📚 بدء نشر دفعة — {doc.get('novel_arabic', slug)} {time_str}",
                 f"جاري نشر {len(batch)} فصل...\n0/{len(batch)}",
                 Colors.INFO
             )
@@ -726,7 +753,6 @@ async def run_serial_batch(serial_id: str):
             except:
                 pass
 
-        # محاولة النشر مع إعادة المحاولة
         ok, attempts = await _publish_with_retry(
             slug, ch_data["number"], ch_data["title"], ch_data["content"],
             api, channel, progress_msg, idx, len(batch)
@@ -743,7 +769,6 @@ async def run_serial_batch(serial_id: str):
             fail += 1
             stats.record(False)
             account_manager.record_publish(False)
-            # حفظ الفصل الفاشل في قاعدة البيانات
             failed_chapters.append({
                 "slug": slug,
                 "number": ch_data["number"],
@@ -753,7 +778,6 @@ async def run_serial_batch(serial_id: str):
                 "failed_at": datetime.now(BAGHDAD_TZ).isoformat(),
                 "attempts": MAX_RETRY_ATTEMPTS
             })
-            # تحديث رسالة التقدم بحالة الفشل
             if channel and progress_msg:
                 try:
                     await progress_msg.edit(
@@ -770,7 +794,6 @@ async def run_serial_batch(serial_id: str):
 
         await asyncio.sleep(PUBLISH_SLEEP)
 
-    # حفظ الفصول الفاشلة في قاعدة البيانات
     if failed_chapters:
         failed_col = db[FAILED_CHAPTERS_COLLECTION]
         for fc in failed_chapters:
@@ -780,7 +803,6 @@ async def run_serial_batch(serial_id: str):
                 upsert=True
             )
 
-    # تحديث عدد المنشورات
     if pub > 0:
         await db.serial_schedules.update_one(
             {"_id": serial_id},
@@ -800,16 +822,15 @@ async def run_serial_batch(serial_id: str):
             source="serial",
         )
 
-    # إرسال تقرير نهائي
     doc_updated = await db.serial_schedules.find_one({"_id": serial_id})
     new_count = doc_updated.get("published_count", published_count) if doc_updated else published_count
     remaining = total - new_count
-    batches_left = max(0, (remaining + batch_size - 1) // batch_size)
+    batches_left = max(0, (remaining + current_batch - 1) // current_batch)
 
     if channel and progress_msg:
         nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
         embed = make_embed(
-            f"✅ دفعة جديدة — {doc.get('novel_arabic','')}",
+            f"✅ دفعة جديدة — {doc.get('novel_arabic','')} {time_str}",
             f"تم نشر الفصول: {nums_str}\n\n"
             f"`{_serial_bar(new_count, total)}`\n\n"
             f"المنشور: {new_count}/{total}  |  المتبقي: {remaining}  |  دفعات باقية: {batches_left}",
@@ -824,10 +845,9 @@ async def run_serial_batch(serial_id: str):
             )
         await progress_msg.edit(embed=embed)
     elif channel:
-        # إذا لم يكن هناك progress_msg (نادراً) نرسل رسالة جديدة
         nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
         embed = make_embed(
-            f"✅ دفعة جديدة — {doc.get('novel_arabic','')}",
+            f"✅ دفعة جديدة — {doc.get('novel_arabic','')} {time_str}",
             f"تم نشر الفصول: {nums_str}\n\n"
             f"`{_serial_bar(new_count, total)}`\n\n"
             f"المنشور: {new_count}/{total}  |  المتبقي: {remaining}  |  دفعات باقية: {batches_left}",
@@ -842,7 +862,7 @@ async def run_serial_batch(serial_id: str):
             )
         await channel.send(embed=embed)
 
-    log.info(f"[Serial] دفعة {serial_id}: نُشر {pub}، فشل {fail} | متبقٍ: {remaining}")
+    log.info(f"[Serial] دفعة {serial_id} (موعد {time_index+1}): نُشر {pub}، فشل {fail} | متبقٍ: {remaining}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1592,11 +1612,14 @@ class BatchConfirmView(discord.ui.View):
 # ══════════════════════════════════════════════════════════════
 
 class DailyTimePickerView(discord.ui.View):
-    def __init__(self, uid: int):
+    def __init__(self, uid: int, allow_two_times: bool = False):
         super().__init__(timeout=180)
         self.uid     = uid
+        self.allow_two_times = allow_two_times
         self.hour24: Optional[int] = None
         self.minute: Optional[int] = None
+        self.hour24_2: Optional[int] = None
+        self.minute_2: Optional[int] = None
         self.done    = False
         self._render_hour()
 
@@ -1612,14 +1635,18 @@ class DailyTimePickerView(discord.ui.View):
         sel_pm  = discord.ui.Select(placeholder="مساءً — اختر الساعة...",  options=pm_opts)
         sel_pm.callback = self._on_hour
         self.add_item(sel_am); self.add_item(sel_pm)
+        if self.allow_two_times:
+            two_btn = discord.ui.Button(label="إضافة موعد ثانٍ (اختياري)", style=discord.ButtonStyle.secondary)
+            two_btn.callback = self._add_second_time
+            self.add_item(two_btn)
         cancel = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
         cancel.callback = self._on_cancel
         self.add_item(cancel)
 
-    def _render_minute(self):
+    def _render_minute(self, is_second: bool = False):
         self.clear_items()
         sel = discord.ui.Select(placeholder="اختر الدقيقة...", options=_build_minute_options()[:25])
-        sel.callback = self._on_minute
+        sel.callback = lambda i: self._on_minute(i, is_second)
         back = discord.ui.Button(label="رجوع للساعة", style=discord.ButtonStyle.secondary)
         back.callback = self._on_back
         cancel = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
@@ -1631,30 +1658,118 @@ class DailyTimePickerView(discord.ui.View):
         val = i.data["values"][0]; period, h = val.split("_")
         self.hour24 = _to_24h(period, int(h))
         h12 = int(h); per_ar = "صباحاً" if period == "am" else "مساءً"
-        self._render_minute()
+        self._render_minute(False)
         await i.response.edit_message(
             embed=make_embed("اختر الدقيقة",
-                f"الساعة المختارة: **{h12:02d} {per_ar}**\n\nالآن اختر الدقيقة:", Colors.PURPLE),
+                f"الموعد الأول: **{h12:02d} {per_ar}**\n\nالآن اختر الدقيقة:", Colors.PURPLE),
             view=self
         )
 
-    async def _on_minute(self, i: discord.Interaction):
+    async def _add_second_time(self, i: discord.Interaction):
         if not self._guard(i): return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        self.minute = int(i.data["values"][0])
-        self.done   = True
+        if self.hour24 is None:
+            await i.response.send_message(embed=err_embed("حدد الموعد الأول أولاً"), ephemeral=True)
+            return
+        # تغيير القائمة لاختيار الموعد الثاني
+        am_opts = [discord.SelectOption(label=f"{h:02d}:00 صباحاً", value=f"am_{h}", emoji="🌅") for h in range(1, 13)]
+        pm_opts = [discord.SelectOption(label=f"{h:02d}:00 مساءً",  value=f"pm_{h}", emoji="🌆") for h in range(1, 13)]
+        sel_am  = discord.ui.Select(placeholder="صباحاً — الموعد الثاني...", options=am_opts)
+        sel_am.callback = self._on_hour_second
+        sel_pm  = discord.ui.Select(placeholder="مساءً — الموعد الثاني...", options=pm_opts)
+        sel_pm.callback = self._on_hour_second
+        self.clear_items()
+        self.add_item(sel_am); self.add_item(sel_pm)
+        back = discord.ui.Button(label="رجوع", style=discord.ButtonStyle.secondary)
+        back.callback = self._on_back
+        cancel = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
+        cancel.callback = self._on_cancel
+        self.add_item(back); self.add_item(cancel)
+        await i.response.edit_message(
+            embed=make_embed("اختر الموعد الثاني",
+                f"الموعد الأول: **{self.hour24//12 or 12:02d} {'صباحاً' if self.hour24 < 12 else 'مساءً'}**\n\nالآن اختر الموعد الثاني:",
+                Colors.PURPLE),
+            view=self
+        )
+
+    async def _on_hour_second(self, i: discord.Interaction):
+        if not self._guard(i): return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        val = i.data["values"][0]; period, h = val.split("_")
+        self.hour24_2 = _to_24h(period, int(h))
+        h12 = int(h); per_ar = "صباحاً" if period == "am" else "مساءً"
+        self._render_minute(True)
+        await i.response.edit_message(
+            embed=make_embed("اختر دقيقة الموعد الثاني",
+                f"الموعد الأول: **{self.hour24//12 or 12:02d} {'صباحاً' if self.hour24 < 12 else 'مساءً'}**\n"
+                f"الموعد الثاني: **{h12:02d} {per_ar}**\n\nاختر الدقيقة:",
+                Colors.PURPLE),
+            view=self
+        )
+
+    async def _on_minute(self, i: discord.Interaction, is_second: bool):
+        if not self._guard(i): return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        minute = int(i.data["values"][0])
+        if is_second:
+            self.minute_2 = minute
+            self.done = True
+            h1 = self.hour24 // 12 or 12; per1 = "صباحاً" if self.hour24 < 12 else "مساءً"
+            h2 = self.hour24_2 // 12 or 12; per2 = "صباحاً" if self.hour24_2 < 12 else "مساءً"
+            self.clear_items()
+            await i.response.edit_message(
+                embed=ok_embed("تم تحديد الوقتين",
+                    f"الموعد الأول: **{h1:02d}:{self.minute:02d} {per1}**\n"
+                    f"الموعد الثاني: **{h2:02d}:{minute:02d} {per2}**\n\n"
+                    f"سينشر البوت يومياً في هذين الموعدين."),
+                view=self
+            )
+            self.stop()
+        else:
+            self.minute = minute
+            if self.allow_two_times:
+                # نعرض خيار إضافة موعد ثانٍ
+                self.clear_items()
+                two_btn = discord.ui.Button(label="إضافة موعد ثانٍ (اختياري)", style=discord.ButtonStyle.secondary)
+                two_btn.callback = self._add_second_time
+                confirm_btn = discord.ui.Button(label="تأكيد موعد واحد فقط", style=discord.ButtonStyle.success)
+                confirm_btn.callback = self._confirm_one_time
+                cancel = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
+                cancel.callback = self._on_cancel
+                self.add_item(two_btn); self.add_item(confirm_btn); self.add_item(cancel)
+                h12 = self.hour24 % 12 or 12; per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+                await i.response.edit_message(
+                    embed=make_embed("إضافة موعد آخر؟",
+                        f"الموعد الحالي: **{h12:02d}:{self.minute:02d} {per_ar}**\n\n"
+                        f"يمكنك إضافة موعد ثانٍ (اختياري) أو تأكيد موعد واحد.",
+                        Colors.PURPLE),
+                    view=self
+                )
+            else:
+                self.done = True
+                h12 = self.hour24 % 12 or 12; per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+                self.clear_items()
+                await i.response.edit_message(
+                    embed=ok_embed("تم تحديد الوقت",
+                        f"سينشر البوت كل يوم الساعة **{h12:02d}:{self.minute:02d} {per_ar}** (بغداد)"),
+                    view=self
+                )
+                self.stop()
+
+    async def _confirm_one_time(self, i: discord.Interaction):
+        if not self._guard(i): return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        self.done = True
         h12 = self.hour24 % 12 or 12; per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
         self.clear_items()
         await i.response.edit_message(
-            embed=make_embed("تم تحديد الوقت اليومي",
-                f"سينشر البوت كل يوم الساعة **{h12:02d}:{self.minute:02d} {per_ar}** (بغداد)",
-                Colors.SUCCESS),
+            embed=ok_embed("تم تحديد موعد واحد",
+                f"سينشر البوت كل يوم الساعة **{h12:02d}:{self.minute:02d} {per_ar}** (بغداد)\n\n"
+                f"(يمكنك إضافة موعد ثانٍ لاحقاً من إعدادات الجدول)"),
             view=self
         )
         self.stop()
 
     async def _on_back(self, i: discord.Interaction):
         if not self._guard(i): return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        self.hour24 = None; self._render_hour()
+        self.hour24 = self.minute = self.hour24_2 = self.minute_2 = None
+        self._render_hour()
         await i.response.edit_message(
             embed=make_embed("اختر الساعة", "اختر الساعة (صباحاً أو مساءً):", Colors.PURPLE), view=self
         )
@@ -1680,14 +1795,19 @@ class SerialChaptersPreviewView(discord.ui.View):
         doc   = self.doc; total = doc.get("total_chapters", len(self.chapters))
         done  = doc.get("published_count", 0); batch = doc.get("batch_size", 1)
         h, m  = doc.get("hour", 0), doc.get("minute", 0)
+        h2 = doc.get("hour2"); m2 = doc.get("minute2")
         h12   = h % 12 or 12; per_ar = "صباحاً" if h < 12 else "مساءً"
+        time_str = f"{h12:02d}:{m:02d} {per_ar}"
+        if h2 is not None and m2 is not None:
+            h12_2 = h2 % 12 or 12; per_ar2 = "صباحاً" if h2 < 12 else "مساءً"
+            time_str += f" و {h12_2:02d}:{m2:02d} {per_ar2}"
         remaining    = total - done
         batches_left = max(0, (remaining + batch - 1) // batch) if remaining > 0 else 0
 
         embed = make_embed(
             f"{doc.get('novel_arabic','الرواية')} — معاينة الجدول التسلسلي",
             f"`{_serial_bar(done, total)}`\n\n"
-            f"**وقت النشر:** `{h12:02d}:{m:02d} {per_ar}` يومياً (بغداد)\n"
+            f"**وقت النشر:** `{time_str}` يومياً (بغداد)\n"
             f"**الدفعة:** `{batch}` فصل | **دفعات متبقية:** `{batches_left}`\n"
             f"**منشور:** `{done}` | **متبقٍ:** `{remaining}`",
             Colors.PURPLE
@@ -1755,11 +1875,21 @@ class SerialActionView(discord.ui.View):
         delete_btn = discord.ui.Button(label="حذف الجدول", style=discord.ButtonStyle.danger)
         delete_btn.callback = self._delete; self.add_item(delete_btn)
 
+        # أزرار النشر اليدوي
+        now_btn = discord.ui.Button(label="نشر دفعة اليوم الآن", style=discord.ButtonStyle.success, emoji="⚡")
+        now_btn.callback = self._publish_now
+        self.add_item(now_btn)
+
     def _detail_embed(self) -> discord.Embed:
         doc   = self.doc; total = doc.get("total_chapters", 0)
         done  = doc.get("published_count", 0); batch = doc.get("batch_size", 1)
         h, m  = doc.get("hour", 0), doc.get("minute", 0)
+        h2 = doc.get("hour2"); m2 = doc.get("minute2")
         h12   = h % 12 or 12; per_ar = "صباحاً" if h < 12 else "مساءً"
+        time_str = f"{h12:02d}:{m:02d} {per_ar}"
+        if h2 is not None and m2 is not None:
+            h12_2 = h2 % 12 or 12; per_ar2 = "صباحاً" if h2 < 12 else "مساءً"
+            time_str += f" و {h12_2:02d}:{m2:02d} {per_ar2}"
         remaining = total - done
         status    = "متوقف مؤقتاً" if doc.get("paused") else ("مكتمل" if doc.get("finished") else "نشط")
         color     = Colors.WARNING if doc.get("paused") else (Colors.GOLD if doc.get("finished") else Colors.SUCCESS)
@@ -1768,7 +1898,7 @@ class SerialActionView(discord.ui.View):
             f"{doc.get('novel_arabic','الرواية')}",
             f"`{_serial_bar(done, total)}`\n\n"
             f"**الحالة:** {status}\n"
-            f"**وقت النشر:** `{h12:02d}:{m:02d} {per_ar}` يومياً\n"
+            f"**وقت النشر:** `{time_str}` يومياً\n"
             f"**الدفعة:** `{batch}` فصل\n"
             f"**الإعلان التلقائي:** {ann_icon}\n"
             f"**منشور:** `{done}` | **متبقٍ:** `{remaining}`",
@@ -1777,11 +1907,10 @@ class SerialActionView(discord.ui.View):
 
     async def _preview(self, i: discord.Interaction):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-        # جلب الفصول من serial_chapters (بدون المحتوى)
         db = db_client.get_database("rewyat_bot")
         chapters_cursor = db.serial_chapters.find(
             {"serial_id": self.doc["_id"]},
-            {"content_compressed": 0}   # استبعاد المحتوى لتخفيف الحجم
+            {"content_compressed": 0}
         ).sort("number", 1)
         chapters = await chapters_cursor.to_list(length=10000)
         view = SerialChaptersPreviewView(chapters, self.doc, self.uid)
@@ -1794,8 +1923,12 @@ class SerialActionView(discord.ui.View):
         db = db_client.get_database("rewyat_bot")
         await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": True}})
         self.doc["paused"] = True
-        try: scheduler.pause_job(f"serial_{sid}")
-        except Exception: pass
+        try:
+            scheduler.pause_job(f"serial_{sid}_0")
+            if self.doc.get("hour2") is not None:
+                scheduler.pause_job(f"serial_{sid}_1")
+        except Exception:
+            pass
         self._build()
         await i.response.edit_message(embed=self._detail_embed(), view=self)
 
@@ -1806,11 +1939,16 @@ class SerialActionView(discord.ui.View):
         await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": False}})
         self.doc["paused"] = False
         try:
-            scheduler.resume_job(f"serial_{sid}")
+            scheduler.resume_job(f"serial_{sid}_0")
+            if self.doc.get("hour2") is not None:
+                scheduler.resume_job(f"serial_{sid}_1")
         except Exception:
             try:
                 scheduler.add_job(run_serial_batch, CronTrigger(hour=self.doc["hour"], minute=self.doc["minute"], timezone=BAGHDAD_TZ),
-                                   args=[sid], id=f"serial_{sid}", replace_existing=True)
+                                   args=[sid, 0], id=f"serial_{sid}_0", replace_existing=True)
+                if self.doc.get("hour2") is not None:
+                    scheduler.add_job(run_serial_batch, CronTrigger(hour=self.doc["hour2"], minute=self.doc["minute2"], timezone=BAGHDAD_TZ),
+                                       args=[sid, 1], id=f"serial_{sid}_1", replace_existing=True)
             except Exception as e:
                 log.error(f"[Serial] فشل استئناف {sid}: {e}")
         self._build()
@@ -1820,11 +1958,14 @@ class SerialActionView(discord.ui.View):
         if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
         sid = self.doc["_id"]
         db = db_client.get_database("rewyat_bot")
-        # حذف الجدول وجميع فصوله
         await db.serial_schedules.delete_one({"_id": sid})
         await db.serial_chapters.delete_many({"serial_id": sid})
-        try: scheduler.remove_job(f"serial_{sid}")
-        except Exception: pass
+        try:
+            scheduler.remove_job(f"serial_{sid}_0")
+            if self.doc.get("hour2") is not None:
+                scheduler.remove_job(f"serial_{sid}_1")
+        except Exception:
+            pass
         self.clear_items()
         await i.response.edit_message(
             embed=ok_embed("تم الحذف", f"تم حذف جدول **{self.doc.get('novel_arabic','الرواية')}** بنجاح."),
@@ -1840,6 +1981,83 @@ class SerialActionView(discord.ui.View):
         self.doc["announce_enabled"] = new_val
         self._build()
         await i.response.edit_message(embed=self._detail_embed(), view=self)
+
+    async def _publish_now(self, i: discord.Interaction):
+        """نشر دفعة اليوم فوراً."""
+        if i.user.id != self.uid: return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        sid = self.doc["_id"]
+        # نتحقق من وجود فصول متبقية
+        db = db_client.get_database("rewyat_bot")
+        doc = await db.serial_schedules.find_one({"_id": sid})
+        if not doc:
+            return await i.response.send_message(embed=err_embed("الجدول غير موجود"), ephemeral=True)
+        if doc.get("finished", False):
+            return await i.response.send_message(embed=warn_embed("الجدول مكتمل"), ephemeral=True)
+        if doc.get("published_count", 0) >= doc.get("total_chapters", 0):
+            return await i.response.send_message(embed=warn_embed("جميع الفصول منشورة"), ephemeral=True)
+
+        # نعرض خيارات: الموعد الأول، الموعد الثاني، كلاهما
+        view = discord.ui.View(timeout=60)
+        chosen = {}
+
+        btn1 = discord.ui.Button(label="الموعد الأول فقط", style=discord.ButtonStyle.primary)
+        btn2 = discord.ui.Button(label="الموعد الثاني فقط", style=discord.ButtonStyle.primary) if doc.get("hour2") is not None else None
+        btn_both = discord.ui.Button(label="كلا الموعدين", style=discord.ButtonStyle.success) if doc.get("hour2") is not None else None
+
+        async def cb1(inter: discord.Interaction):
+            if inter.user.id != self.uid: return
+            chosen["time_index"] = 0
+            for c in view.children: c.disabled = True
+            await inter.response.edit_message(view=view)
+            view.stop()
+
+        async def cb2(inter: discord.Interaction):
+            if inter.user.id != self.uid: return
+            chosen["time_index"] = 1
+            for c in view.children: c.disabled = True
+            await inter.response.edit_message(view=view)
+            view.stop()
+
+        async def cb_both(inter: discord.Interaction):
+            if inter.user.id != self.uid: return
+            chosen["time_index"] = -1  # كلاهما
+            for c in view.children: c.disabled = True
+            await inter.response.edit_message(view=view)
+            view.stop()
+
+        btn1.callback = cb1
+        if btn2:
+            btn2.callback = cb2
+            btn_both.callback = cb_both
+            view.add_item(btn1); view.add_item(btn2); view.add_item(btn_both)
+        else:
+            view.add_item(btn1)
+
+        cancel_btn = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
+        cancel_btn.callback = lambda inter: (view.stop(), inter.response.edit_message(view=None))
+        view.add_item(cancel_btn)
+
+        await i.response.send_message(
+            embed=make_embed("نشر يدوي — اختر الموعد",
+                f"**{doc.get('novel_arabic', 'الرواية')}**\n"
+                f"اختر الموعد الذي تريد نشره الآن:",
+                Colors.PURPLE),
+            view=view
+        )
+        await view.wait()
+        if "time_index" not in chosen:
+            return
+        time_idx = chosen["time_index"]
+
+        # ننفذ النشر
+        await i.edit_original_response(embed=make_embed("جاري النشر...", "يتم نشر الدفعة...", Colors.WARNING), view=None)
+        if time_idx == -1:
+            # نشر كلا الموعدين
+            await run_serial_batch(sid, 0)
+            await run_serial_batch(sid, 1)
+        else:
+            await run_serial_batch(sid, time_idx)
+        await i.edit_original_response(embed=ok_embed("تم النشر"), view=None)
 
 
 class SerialListView(discord.ui.View):
@@ -1867,7 +2085,7 @@ class SerialListView(discord.ui.View):
 
 
 # ══════════════════════════════════════════════════════════════
-#  معالج النشر التسلسلي (SerialPublisher) — تم تعديل حفظ الفصول
+#  معالج النشر التسلسلي (SerialPublisher) — تم تعديل حفظ الفصول مع دعم موعدين
 # ══════════════════════════════════════════════════════════════
 
 class SerialPublisher:
@@ -1880,6 +2098,8 @@ class SerialPublisher:
         self.batch_size:      int            = 1
         self.hour24:          int            = 10
         self.minute:          int            = 0
+        self.hour24_2:        Optional[int]  = None
+        self.minute_2:        Optional[int]  = None
         self.announce_enabled: bool          = True
 
     async def run(self):
@@ -2011,11 +2231,12 @@ class SerialPublisher:
 
     async def _step_daily_time(self):
         novel_nm = self.novel["arabic"] if self.novel else self.slug
-        time_view = DailyTimePickerView(self.interaction.user.id)
+        time_view = DailyTimePickerView(self.interaction.user.id, allow_two_times=True)
         await self.interaction.followup.send(
             embed=make_embed("نشر تسلسلي — الخطوة 4/5",
                 f"**الرواية:** {novel_nm}\n\n"
                 "حدد الوقت الذي يتم فيه النشر كل يوم.\n"
+                "يمكنك إضافة موعد ثانٍ (اختياري).\n"
                 "اختر الساعة (صباحاً أو مساءً) ثم الدقيقة.",
                 Colors.PURPLE),
             view=time_view
@@ -2025,6 +2246,8 @@ class SerialPublisher:
             raise asyncio.TimeoutError()
         self.hour24 = time_view.hour24
         self.minute = time_view.minute
+        self.hour24_2 = time_view.hour24_2
+        self.minute_2 = time_view.minute_2
 
     async def _step_announce_option(self):
         novel_nm = self.novel["arabic"] if self.novel else self.slug
@@ -2071,6 +2294,11 @@ class SerialPublisher:
         batches = (total + self.batch_size - 1) // self.batch_size
         h12 = self.hour24 % 12 or 12
         per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+        time_str = f"{h12:02d}:{self.minute:02d} {per_ar}"
+        if self.hour24_2 is not None and self.minute_2 is not None:
+            h12_2 = self.hour24_2 % 12 or 12
+            per_ar2 = "صباحاً" if self.hour24_2 < 12 else "مساءً"
+            time_str += f" و {h12_2:02d}:{self.minute_2:02d} {per_ar2}"
 
         confirm_view = discord.ui.View(timeout=120)
         confirmed = {}
@@ -2118,7 +2346,7 @@ class SerialPublisher:
         embed.add_field(name="الرواية",          value=novel_nm,                                         inline=True)
         embed.add_field(name="إجمالي الفصول",    value=f"**{total}** فصل",                               inline=True)
         embed.add_field(name="الدفعة اليومية",   value=f"**{self.batch_size}** فصل/يوم",                  inline=True)
-        embed.add_field(name="وقت النشر",         value=f"**{h12:02d}:{self.minute:02d} {per_ar}** يومياً", inline=True)
+        embed.add_field(name="وقت النشر",         value=f"**{time_str}** يومياً",                         inline=True)
         embed.add_field(name="المدة التقريبية",   value=f"**{batches}** يوم",                             inline=True)
         embed.set_footer(text="اضغط 'بدء الجدول' للتأكيد أو 'معاينة الفصول' لمراجعتها")
 
@@ -2134,7 +2362,6 @@ class SerialPublisher:
 
         db = db_client.get_database("rewyat_bot")
 
-        # 1. حفظ الجدول الأساسي
         schedule_doc = {
             "_id": serial_id,
             "slug": self.slug,
@@ -2145,6 +2372,8 @@ class SerialPublisher:
             "published_count": 0,
             "hour": self.hour24,
             "minute": self.minute,
+            "hour2": self.hour24_2,
+            "minute2": self.minute_2,
             "channel_id": self.interaction.channel_id,
             "guild_id": self.interaction.guild_id if self.interaction.guild else None,
             "created_by": self.interaction.user.id,
@@ -2159,7 +2388,6 @@ class SerialPublisher:
             upsert=True
         )
 
-        # 2. حفظ الفصول في serial_chapters مع ضغط المحتوى
         chapters_col = db.serial_chapters
         for ch in self.chapters:
             compressed = gzip.compress(ch["content"].encode("utf-8"))
@@ -2174,23 +2402,37 @@ class SerialPublisher:
                 upsert=True
             )
 
-        # 3. جدولة المهمة
+        # جدولة الموعد الأول
         scheduler.add_job(
             run_serial_batch,
             CronTrigger(hour=self.hour24, minute=self.minute, timezone=BAGHDAD_TZ),
-            args=[serial_id],
-            id=f"serial_{serial_id}",
+            args=[serial_id, 0],
+            id=f"serial_{serial_id}_0",
             replace_existing=True
         )
+        # جدولة الموعد الثاني إن وجد
+        if self.hour24_2 is not None and self.minute_2 is not None:
+            scheduler.add_job(
+                run_serial_batch,
+                CronTrigger(hour=self.hour24_2, minute=self.minute_2, timezone=BAGHDAD_TZ),
+                args=[serial_id, 1],
+                id=f"serial_{serial_id}_1",
+                replace_existing=True
+            )
 
         total = len(self.chapters)
         batches = (total + self.batch_size - 1) // self.batch_size
         h12 = self.hour24 % 12 or 12
         per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+        time_str = f"{h12:02d}:{self.minute:02d} {per_ar}"
+        if self.hour24_2 is not None and self.minute_2 is not None:
+            h12_2 = self.hour24_2 % 12 or 12
+            per_ar2 = "صباحاً" if self.hour24_2 < 12 else "مساءً"
+            time_str += f" و {h12_2:02d}:{self.minute_2:02d} {per_ar2}"
 
         success_embed = make_embed("تم إنشاء الجدول التسلسلي بنجاح!", color=Colors.SUCCESS)
         success_embed.description = f"سينشر البوت فصول **{novel_nm}** تلقائياً كل يوم.\n\n`{_serial_bar(0, total)}`"
-        success_embed.add_field(name="وقت النشر",      value=f"`{h12:02d}:{self.minute:02d} {per_ar}` يومياً", inline=True)
+        success_embed.add_field(name="وقت النشر",      value=f"`{time_str}` يومياً", inline=True)
         success_embed.add_field(name="الدفعة",         value=f"`{self.batch_size}` فصل/مرة",                    inline=True)
         success_embed.add_field(name="عدد الدفعات",    value=f"`{batches}` دفعة",                              inline=True)
         success_embed.add_field(name="إجمالي الفصول",  value=f"`{total}` فصل",                                  inline=True)
@@ -2468,12 +2710,10 @@ async def cmd_stats(interaction: discord.Interaction):
     h, rem = divmod(int(up.total_seconds()), 3600); m = rem // 60
 
     db = db_client.get_database("rewyat_bot")
-    # إحصائيات الجداول التسلسلية من MongoDB
     serial_total = await db.serial_schedules.count_documents({})
     serial_active = await db.serial_schedules.count_documents({"finished": False, "paused": False})
     serial_finished = await db.serial_schedules.count_documents({"finished": True})
     
-    # إحصائيات الفصول الفاشلة
     failed_count = await db.failed_chapters.count_documents({})
 
     await interaction.response.send_message(
@@ -2487,7 +2727,7 @@ async def cmd_stats(interaction: discord.Interaction):
             {"name": "الروايات",          "value": f"`{len(novel_store.novels)}`",    "inline": True},
             {"name": "وقت التشغيل",      "value": f"`{h}h {m}m`",                   "inline": True},
             {"name": "جداول تسلسلية",    "value": f"نشطة: `{serial_active}` | مكتملة: `{serial_finished}` | الكل: `{serial_total}`", "inline": False},
-            {"name": "فصول فاشلة",       "value": f"`{failed_count}` فصل في قائمة الانتظار لإعادة المحاولة\nاستخدم `/فصول_فاشلة` لعرضها", "inline": False},
+            {"name": "فصول فاشلة",       "value": f"`{failed_count}` فصل في قائمة الانتظار\nاستخدم `/فصول_فاشلة` لعرضها", "inline": False},
         ])
     )
 
@@ -2531,11 +2771,11 @@ async def cmd_help(interaction: discord.Interaction):
             {"name": "الحسابات",          "value": "`/اضافة_حساب` `/حساباتي` `/تبديل_حساب`",     "inline": False},
             {"name": "النشر التسلسلي",   "value": "`/نشر_تسلسلي` `/جداولي_التسلسلية` `/معاينة_تسلسلي`", "inline": False},
             {"name": "الفصول الفاشلة",   "value": "`/فصول_فاشلة` `/اعادة_نشر_فصل` `/اعادة_نشر_كل_فصول_رواية` `/اعادة_نشر_كل_الفصول`", "inline": False},
-            {"name": "أخرى",             "value": "`/إحصاءات` `/مساعدة`",                         "inline": False},
+            {"name": "نشر تسلسلي يدوي",  "value": "من لوحة التحكم `/جداولي_التسلسلية` اختر جدولاً ثم اضغط 'نشر دفعة اليوم الآن'", "inline": False},
             {"name": "ملاحظات",
              "value": (
                  "جدولة الفصل: اختر السنة، الشهر، اليوم، الساعة والدقيقة.\n"
-                 "التسلسلي: ارفع ZIP كامل للرواية، حدد الدفعة والوقت اليومي.\n"
+                 "التسلسلي: ارفع ZIP كامل للرواية، حدد الدفعة والوقت اليومي (يمكنك إضافة موعد ثانٍ اختياري).\n"
                  "ZIP: سمِّ الملفات 1.txt, 2.txt ...\n"
                  "البوت يعمل بتوقيت العراق (Asia/Baghdad).\n"
                  "الفصول الفاشلة تُحفظ تلقائياً ويمكن إعادة نشرها يدوياً."
@@ -2610,7 +2850,6 @@ async def cmd_preview_serial(interaction: discord.Interaction):
 
     if len(docs) == 1:
         doc = docs[0]
-        # جلب الفصول (بدون المحتوى)
         chapters_cursor = db.serial_chapters.find(
             {"serial_id": doc["_id"]},
             {"content_compressed": 0}
@@ -2671,7 +2910,6 @@ async def cmd_failed_chapters(interaction: discord.Interaction):
         )
         return
 
-    # تجميع حسب الرواية
     grouped = {}
     for fc in failed:
         slug = fc["slug"]
@@ -2717,7 +2955,6 @@ async def cmd_retry_chapter(interaction: discord.Interaction, slug: str, number:
         account_manager.record_publish(True)
         novel_store.inc_published(slug, 1)
         await db.failed_chapters.delete_one({"_id": failed["_id"]})
-        # إعلان
         if ann_queue is not None:
             cover = await ann_cog.get_cover(slug) if ann_cog else None
             await ann_queue.register_publish(
@@ -2732,7 +2969,6 @@ async def cmd_retry_chapter(interaction: discord.Interaction, slug: str, number:
             embed=ok_embed("تم نشر الفصل بنجاح", f"**{novel_name}**\nالفصل {number}: {failed['title']}")
         )
     else:
-        # زيادة عدد المحاولات
         await db.failed_chapters.update_one(
             {"_id": failed["_id"]},
             {"$inc": {"attempts": 1}, "$set": {"last_retry": datetime.now(BAGHDAD_TZ).isoformat()}}
@@ -2784,8 +3020,7 @@ async def cmd_retry_novel_failed(interaction: discord.Interaction, slug: str):
         Colors.SUCCESS if fail == 0 else Colors.WARNING
     )
     if pub > 0 and ann_queue is not None:
-        # إعلان واحد عن جميع الفصول المنشورة
-        first = min(fc["number"] for fc in failed if fc["number"] not in [f["number"] for f in failed if not ok]) # مبسط
+        first = min(fc["number"] for fc in failed if fc["number"] not in [f["number"] for f in failed if not ok])
         last = max(fc["number"] for fc in failed if fc["number"] not in [f["number"] for f in failed if not ok])
         cover = await ann_cog.get_cover(slug) if ann_cog else None
         await ann_queue.register_publish(
@@ -2863,17 +3098,8 @@ def _build_announcement_text(
     source: str,
     date_str: str,
 ) -> str:
-    """
-    يبني نص الإعلان المناسب بحسب عدد الروايات ونوع النشر.
-
-    entries: قائمة dict تحتوي كل منها على:
-        novel_arabic, slug, first_chapter, last_chapter
-
-    source: "serial" | "manual" | "batch" | "scheduled"
-    """
     n = len(entries)
 
-    # ── إعلان رواية واحدة ──
     if n == 1:
         e   = entries[0]
         url = _build_novel_url(e["slug"])
@@ -2898,7 +3124,7 @@ def _build_announcement_text(
                 f"────\n{date_str}\n────\n\n"
                 f"رابط الرواية:\n{url}"
             )
-        else:  # batch
+        else:
             return (
                 f"تم نشر دفعة جديدة من رواية\n"
                 f" {e['novel_arabic']} \n\n"
@@ -2908,7 +3134,6 @@ def _build_announcement_text(
                 f"رابط الرواية:\n{url}"
             )
 
-    # ── روايتان ──
     elif n == 2:
         names = " مع ".join(f" {e['novel_arabic']} " for e in entries)
         details = "\n".join(
@@ -2940,7 +3165,6 @@ def _build_announcement_text(
                 f"روابط الروايات:\n{urls}"
             )
 
-    # ── ثلاث روايات أو أكثر ──
     else:
         return (
             f"تم بحمد الله تعالى تنزيل دفعة اليوم من الفصول لجميع الروايات كما موضح في الصورة.\n\n"
@@ -2952,7 +3176,7 @@ def _build_announcement_text(
 
 
 # ══════════════════════════════════════════════════════════════
-#  معالج النص العربي — بدون مكتبات خارجية (يعمل بدون libraqm)
+#  معالج النص العربي
 # ══════════════════════════════════════════════════════════════
 
 _AR_JOIN = {
@@ -3008,18 +3232,12 @@ _AR_LAM_ALEF = {
     '\u0644\u0625':'\uFEF9','\u0644\u0627':'\uFEFB',
 }
 
-
 def _reshape_arabic(text: str) -> str:
-    """
-    يُحوِّل النص العربي إلى أشكال عرض صحيحة (Presentation Forms)
-    ويعكس الترتيب للعرض RTL — بدون مكتبات خارجية ودون الحاجة لـ libraqm.
-    """
     chars = list(str(text))
     result = []
     i = 0
     while i < len(chars):
         ch = chars[i]
-        # لام-ألف ليغاتشر
         if ch == '\u0644' and i+1 < len(chars) and chars[i+1] in '\u0622\u0623\u0625\u0627':
             pair = ch + chars[i+1]
             if pair in _AR_LAM_ALEF:
@@ -3043,13 +3261,9 @@ def _reshape_arabic(text: str) -> str:
         i += 1
     return ''.join(reversed(result))
 
-
 def _ar(text: str) -> str:
-    """اختصار: يُشكّل النص ويعكسه للعرض الصحيح."""
     return _reshape_arabic(str(text))
 
-
-# مسارات خطوط احتياطية إضافية (موجودة غالباً على أغلب صور Docker/Linux)
 FALLBACK_FONT_PATHS = [
     ARABIC_FONT_PATH,
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -3058,48 +3272,37 @@ FALLBACK_FONT_PATHS = [
 ]
 
 def _load_arabic_font(size: int) -> "ImageFont.FreeTypeFont":
-    """يحمّل خط قابل للتحجيم من Google (Amiri) أو من مسارات محلية احتياطية."""
     if not PILLOW_OK:
         return ImageFont.load_default()
-
-    # 1. حاول استخدام الخط المحمّل من Google (إن وجد)
     if ARABIC_FONT_BYTES is not None:
         try:
             return ImageFont.truetype(io.BytesIO(ARABIC_FONT_BYTES), size)
         except Exception as e:
             log.warning(f"فشل استخدام خط Amiri المحمّل: {e}")
-
-    # 2. احتياطي: جرّب عدّة مسارات محلية قابلة للتحجيم
     for path in FALLBACK_FONT_PATHS:
         if os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size)
             except Exception as e:
                 log.warning(f"فشل تحميل الخط من {path}: {e}")
-
-    # 3. فشل الجميع → الخط الافتراضي (تحذير: لا يستجيب لتغيير الحجم في أغلب الحالات)
     log.error(
         f"⚠️ لا يوجد أي خط TTF قابل للتحجيم على هذا السيرفر — سيظهر النص بحجم ثابت "
         f"بدل الحجم المطلوب ({size}px). ثبّت خط unifont أو تأكد من نجاح تحميل Amiri."
     )
     try:
-        return ImageFont.load_default(size=size)   # يعمل فقط على Pillow >= 10.1
+        return ImageFont.load_default(size=size)
     except TypeError:
         return ImageFont.load_default()
 
-
 def _text_width(draw: "ImageDraw.Draw", text: str, font) -> int:
-    """يقيس عرض نص بالبكسل."""
     try:
         bb = draw.textbbox((0, 0), text, font=font)
         return bb[2] - bb[0]
     except Exception:
         return len(text) * (font.size if hasattr(font, 'size') else 10)
 
-
 def _wrap_ar_text(text: str, font, max_w: int, draw_ref: "ImageDraw.Draw",
                   max_lines: int = 2) -> List[str]:
-    """يكسر النص العربي المُشكَّل إلى سطور حسب العرض المتاح."""
     words = str(text).split()
     lines: List[str] = []
     cur: List[str] = []
@@ -3122,58 +3325,42 @@ def _wrap_ar_text(text: str, font, max_w: int, draw_ref: "ImageDraw.Draw",
 
 
 # ══════════════════════════════════════════════════════════════
-#  Canvas الإعلان — تصميم يطابق تصميم الموقع بألوان ذهبية
+#  Canvas الإعلان
 # ══════════════════════════════════════════════════════════════
 
-# ── ألوان التصميم ──
-_C_BG         = (22,  22,  34)   # خلفية داكنة
-_C_CARD       = (32,  32,  50)   # خلفية البطاقة
-_C_DIVIDER    = (55,  50,  90)   # فاصل بين البطاقات
-_C_COVER_PH   = (45,  35,  75)   # placeholder الغلاف
-_C_COVER_BRD  = (80,  60, 120)   # إطار placeholder
-_C_GOLD_TITLE = (212, 175,  55)  # لون اسم الرواية
-_C_GOLD_CH    = (255, 200,  80)  # لون رقم الفصل
-_C_META       = (140, 135, 165)  # لون النصوص الثانوية
-_C_FOOTER_URL = (180, 150,  60)  # لون رابط الموقع في الذيل
-_C_FOOTER_DT  = (120, 115, 145)  # لون التاريخ
+_C_BG         = (22,  22,  34)
+_C_CARD       = (32,  32,  50)
+_C_DIVIDER    = (55,  50,  90)
+_C_COVER_PH   = (45,  35,  75)
+_C_COVER_BRD  = (80,  60, 120)
+_C_GOLD_TITLE = (212, 175,  55)
+_C_GOLD_CH    = (255, 200,  80)
+_C_META       = (140, 135, 165)
+_C_FOOTER_URL = (180, 150,  60)
+_C_FOOTER_DT  = (120, 115, 145)
 
-# ── أبعاد ──
-_CARD_H     = 170    # ارتفاع البطاقة
-_COLS       = 2      # أعمدة
-_CARD_PAD   = 0      # لا padding خارجي (مثل الموقع)
-_ROW_GAP    = 1      # مسافة بين الصفوف
-_COVER_W    = 108    # عرض الغلاف
-_COVER_H    = 150    # ارتفاع الغلاف
-_COVER_PAD  = 10     # مسافة الغلاف من حافة البطاقة
-_TEXT_LPAD  = 16     # padding يسار النص
+_CARD_H     = 170
+_COLS       = 2
+_CARD_PAD   = 0
+_ROW_GAP    = 1
+_COVER_W    = 108
+_COVER_H    = 150
+_COVER_PAD  = 10
+_TEXT_LPAD  = 16
 _FOOTER_H   = 44
-_TOTAL_W    = 1060   # عرض الصورة لعمودين، 530 لعمود واحد
+_TOTAL_W    = 1060
 
+ANN_BG_BYTES: Optional[bytes] = None
 
-
-# ── صورة الخلفية محفوظة في الذاكرة عند التهيئة ──
-ANN_BG_BYTES: Optional[bytes] = None   # يُضبط في main() من المسار المحفوظ في DB
-
-# ── ثوابت تصميم ZEUS ──
 _ZEUS_BG_W   = 1983
 _ZEUS_BG_H   = 793
 _GOLD_BRD    = (180, 120, 20)
 _GOLD_TEXT   = (255, 220, 100)
 _CHAP_BG     = (18, 12, 6)
-_BRD_PX      = 3     # سماكة الإطار الذهبي
+_BRD_PX      = 3
 
 
 class AnnouncementCanvas:
-    """
-    يرسم صورة إعلان بتصميم ZEUS:
-    - خلفية ثابتة (صورة ZEUS المحفوظة)، تُمدّ رأسياً عند الحاجة
-    - كل رواية: بطاقة (غلاف + إطار ذهبي) + مربع رقم الفصول تحتها
-    - 1 رواية: كانفاس ضيق (نصف العرض)
-    - 2-4: على صف واحد
-    - 5+ : 4 في الصف الأول ثم 4 في الصف التالي...
-    entries: [{"first_chapter", "last_chapter", "cover_bytes"}]
-    """
-
     def __init__(self, entries: List[Dict]):
         self.entries = entries
 
@@ -3186,7 +3373,6 @@ class AnnouncementCanvas:
     @staticmethod
     def _paste_cover(canvas: "Image.Image", entry: Dict,
                      cx: int, cy: int, cw: int, ch: int, radius: int = 8):
-        """يرسم غلاف الرواية أو placeholder داخل البطاقة."""
         draw = ImageDraw.Draw(canvas)
         if entry.get("cover_bytes"):
             try:
@@ -3207,7 +3393,6 @@ class AnnouncementCanvas:
                 return
             except Exception:
                 pass
-        # placeholder داكن بتدرج
         for y_off in range(ch):
             ratio = y_off / ch
             r = int(20 + ratio * 20); g = int(10 + ratio * 10); b = int(40 + ratio * 30)
@@ -3220,7 +3405,6 @@ class AnnouncementCanvas:
         if n == 0:
             raise ValueError("لا روايات")
 
-        # ── حجم البطاقة حسب العدد ──
         if n <= 8:
             CARDS_PER_ROW = 4
         else:
@@ -3233,18 +3417,15 @@ class AnnouncementCanvas:
         elif n == 3:
             cw, ch = 360, 555
         else:
-            # 4 أو أكثر: نحسب حجماً يناسب الخلفية
             cw = max(200, (_ZEUS_BG_W - 160) // CARDS_PER_ROW - 40)
             ch = int(cw * (560 / 380))
 
         CHAP_H    = max(44, int(ch * 0.08))
         CHAP_GAP  = 10
-        CARD_TOT  = ch + CHAP_GAP + CHAP_H   # ارتفاع البطاقة الكاملة
-        CARD_GAP  = max(24, int(cw * 0.07))  # مسافة بين البطاقات
-
+        CARD_TOT  = ch + CHAP_GAP + CHAP_H
+        CARD_GAP  = max(24, int(cw * 0.07))
         rows = math.ceil(n / CARDS_PER_ROW)
 
-        # ── أبعاد الكانفاس ──
         ROW_W = CARDS_PER_ROW * cw + (CARDS_PER_ROW - 1) * CARD_GAP
         if n == 1:
             CANVAS_W = cw + 120
@@ -3254,11 +3435,9 @@ class AnnouncementCanvas:
         VERT_PAD = max(40, (_ZEUS_BG_H - CARD_TOT) // 2)
         CANVAS_H = max(_ZEUS_BG_H, VERT_PAD * 2 + rows * CARD_TOT + (rows-1) * 50)
 
-        # ── الخلفية ──
         if ANN_BG_BYTES and n > 1:
             try:
                 bg = Image.open(io.BytesIO(ANN_BG_BYTES)).convert("RGB")
-                # مدّ رأسياً إذا لزم
                 if CANVAS_H > _ZEUS_BG_H or CANVAS_W != bg.width:
                     bg = bg.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
                 canvas = bg.copy()
@@ -3280,15 +3459,12 @@ class AnnouncementCanvas:
             cx = x_start + col * (cw + CARD_GAP)
             cy = VERT_PAD + row * (CARD_TOT + 50)
 
-            # الإطار الذهبي
             draw.rounded_rectangle(
                 [cx - _BRD_PX, cy - _BRD_PX, cx + cw + _BRD_PX, cy + ch + _BRD_PX],
                 radius=10, fill=_GOLD_BRD)
 
-            # الغلاف
             self._paste_cover(canvas, entry, cx, cy, cw, ch, radius=7)
 
-            # مربع الفصل
             first = entry.get("first_chapter", 0)
             last  = entry.get("last_chapter", first)
             ch_text = str(first) if first == last else f"{first}-{last}"
@@ -3303,17 +3479,12 @@ class AnnouncementCanvas:
             bx = cx + (cw - box_w) // 2
             by = cy + ch + CHAP_GAP
 
-            # إطار ذهبي للمربع
             draw.rounded_rectangle(
                 [bx - 2, by - 2, bx + box_w + 2, by + CHAP_H + 2],
                 radius=9, fill=_GOLD_BRD)
-            # داخل المربع
             draw.rounded_rectangle(
                 [bx, by, bx + box_w, by + CHAP_H],
                 radius=7, fill=_CHAP_BG)
-            # النص — anchor="mm" يتوسط النص فعلياً (أفقياً وعمودياً) اعتماداً
-            # على مركز الصندوق الهندسي، بدل الاعتماد على th/tw اليدوي الذي
-            # كان يتجاهل الإزاحة العلوية للخط (bb[1]) ويسبب نزول النص للأسفل
             draw.text(
                 (bx + box_w / 2, by + CHAP_H / 2),
                 ch_text, font=font_chap, fill=_GOLD_TEXT, anchor="mm"
@@ -3324,24 +3495,12 @@ class AnnouncementCanvas:
         buf.seek(0)
         return buf.read()
 
-		
 
 # ══════════════════════════════════════════════════════════════
-#  طابور الإعلانات — المنطق المحسّن
+#  طابور الإعلانات
 # ══════════════════════════════════════════════════════════════
 
 class AnnouncementQueue:
-    """
-    طابور الإعلانات الذكي.
-
-    قواعد الانتظار:
-    - نشر منفرد / جماعي / مجدول → إعلان فوري (لا انتظار)
-    - نشر تسلسلي + جداول أخرى ستنتهي خلال SERIAL_CLUSTER_WINDOW_MINUTES →
-      ينتظر حتى آخر جدول في النافذة، ثم يُعلن الجميع معاً
-    - إذا كان الجدول التالي بعد النافذة → يُعلن الموجودين فوراً
-    - ينتظر حتى تنتهي جميع الجداول ضمن النافذة من النشر، ثم يُعلن
-    """
-
     def __init__(self, db_collection, bot: commands.Bot, settings_collection):
         self.col      = db_collection
         self.settings = settings_collection
@@ -3378,21 +3537,18 @@ class AnnouncementQueue:
             if not pending:
                 return
 
-            # هل جميع العناصر المعلقة من نشر غير تسلسلي؟ → أعلن فوراً
             all_non_serial = all(p.get("source") != "serial" for p in pending)
             if all_non_serial:
                 log.info(f"[Queue] نشر غير تسلسلي — إعلان فوري ({len(pending)} عنصر)")
                 await self._fire_announcement(pending)
                 return
 
-            # احسب الجداول التسلسلية القادمة ضمن النافذة
             now           = datetime.now(BAGHDAD_TZ)
             window_end    = now + timedelta(minutes=SERIAL_CLUSTER_WINDOW_MINUTES)
             upcoming      = await self._get_upcoming_serial_times(now)
             within_window = [t for t in upcoming if now < t <= window_end]
 
             if within_window:
-                # أحدث جدول في النافذة
                 latest       = max(within_window)
                 wait_seconds = (latest - now).total_seconds() + 90
                 if wait_seconds < 30:
@@ -3401,29 +3557,24 @@ class AnnouncementQueue:
                     f"[Queue] ينتظر حتى {latest.strftime('%H:%M')} (بغداد) لآخر جدول في النافذة. "
                     f"الانتظار: {wait_seconds/60:.1f} دقيقة"
                 )
-                # إلغاء مهمة إعادة الفحص القديمة إن وجدت
                 if self._pending_recheck and not self._pending_recheck.done():
                     self._pending_recheck.cancel()
                 self._pending_recheck = asyncio.create_task(
                     self._delayed_recheck(wait_seconds, window_end, latest)
                 )
             else:
-                # لا جداول قادمة ضمن النافذة → أعلن الآن
                 log.info(f"[Queue] لا جداول ضمن النافذة — إعلان فوري ({len(pending)} عنصر)")
                 await self._fire_announcement(pending)
 
     async def _delayed_recheck(self, delay_seconds: float, window_end: datetime, latest: datetime):
-        """يعيد الفحص كل 30 ثانية لاكتشاف جداول جديدة أحدث، ويتأكد من انتهاء جميع الجداول في النافذة."""
         db = db_client.get_database("rewyat_bot")
         try:
             slept = 0
-            # نتحقق أولاً من الجداول التي قد تكون ما زالت قيد النشر ضمن النافذة
             while slept < delay_seconds:
                 await asyncio.sleep(30)
                 slept += 30
 
                 now2 = datetime.now(BAGHDAD_TZ)
-                # تحقق من وجود جداول جديدة أحدث من latest
                 new_latest = latest
                 async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
                     published = doc.get("published_count", 0)
@@ -3435,7 +3586,6 @@ class AnnouncementQueue:
                     candidate = now2.replace(hour=h, minute=m, second=0, microsecond=0)
                     if candidate <= now2:
                         candidate += timedelta(days=1)
-                    # إذا كان الجدول ضمن النافذة ووقته أحدث من الأخير، نمدد الانتظار
                     if candidate <= window_end and candidate > new_latest:
                         new_latest = candidate
                         new_delay = (new_latest - now2).total_seconds() + 90
@@ -3447,13 +3597,11 @@ class AnnouncementQueue:
                                 f"تمديد الانتظار {extra/60:.1f} دقيقة إضافية"
                             )
                             latest = new_latest
-                            break  # الخروج من الحلقة الداخلية لإعادة حساب الوقت
+                            break
 
-                # بعد اكتشاف جدول أحدث، نكمل الحلقة الخارجية
                 if latest != new_latest:
                     continue
 
-                # نتحقق مما إذا كانت جميع الجداول ضمن النافذة قد انتهت من النشر
                 all_finished = True
                 async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
                     h = doc.get("hour", 0)
@@ -3461,7 +3609,6 @@ class AnnouncementQueue:
                     candidate = now2.replace(hour=h, minute=m, second=0, microsecond=0)
                     if candidate <= now2:
                         candidate += timedelta(days=1)
-                    # إذا كان الجدول ضمن النافذة ولم ينتهِ بعد، نستمر في الانتظار
                     if candidate <= window_end:
                         published = doc.get("published_count", 0)
                         total = doc.get("total_chapters", 0)
@@ -3471,11 +3618,8 @@ class AnnouncementQueue:
 
                 if all_finished:
                     log.info("[Queue] جميع الجداول ضمن النافذة انتهت، سيتم الإعلان الآن.")
-                    break  # نخرج من حلقة الانتظار
+                    break
 
-                # إذا لم نكسر الحلقة، نستمر في الانتظار حتى نهاية delay_seconds
-
-            # بعد انتهاء الانتظار (أو عند انتهاء جميع الجداول)، نجمع المعلقات ونعلن
             async with self._lock:
                 pending = await self.col.find({"announced": False}).to_list(length=100)
                 if pending:
@@ -3485,7 +3629,6 @@ class AnnouncementQueue:
             log.info("[Queue] مهمة إعادة الفحص أُلغيت (جدول جديد سيتولى)")
 
     async def _get_upcoming_serial_times(self, now: datetime) -> List[datetime]:
-        """يعيد أوقات الجداول التسلسلية النشطة القادمة خلال اليوم من MongoDB."""
         db = db_client.get_database("rewyat_bot")
         upcoming = []
         async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
@@ -3498,16 +3641,20 @@ class AnnouncementQueue:
             if candidate <= now:
                 candidate += timedelta(days=1)
             upcoming.append(candidate)
+            # إذا كان هناك موعد ثانٍ، نضيفه أيضاً
+            if doc.get("hour2") is not None and doc.get("minute2") is not None:
+                h2 = doc["hour2"]; m2 = doc["minute2"]
+                candidate2 = now.replace(hour=h2, minute=m2, second=0, microsecond=0)
+                if candidate2 <= now:
+                    candidate2 += timedelta(days=1)
+                upcoming.append(candidate2)
         return upcoming
 
     async def _fire_announcement(self, pending: list):
-        """يُرسل إعلاناً واحداً يجمع كل الروايات المعلقة."""
         log.info(f"[Queue] إطلاق إعلان لـ {len(pending)} رواية")
-
         date_str = datetime.now(BAGHDAD_TZ).strftime("%Y/%m/%d")
         settings = await self._get_settings()
 
-        # أعد بناء قائمة الإدخالات مع الأغلفة
         entries: List[Dict] = []
         for p in pending:
             cover = p.get("cover_bytes")
@@ -3521,14 +3668,12 @@ class AnnouncementQueue:
                 "cover_bytes":   cover,
             })
 
-        # تحديد source للنص: إذا وجد serial فهو serial، وإلا أكثر تكرار
         sources = [p.get("source", "manual") for p in pending]
         if "serial" in sources:
             source_for_text = "serial"
         else:
             source_for_text = max(set(sources), key=sources.count)
 
-        # بناء النص والصورة
         text = _build_announcement_text(entries, source_for_text, date_str)
 
         image_bytes = None
@@ -3538,11 +3683,9 @@ class AnnouncementQueue:
         except Exception as e:
             log.error(f"[Queue] فشل رسم Canvas: {e}")
 
-        # إرسال
         await self._send_discord(settings, text, image_bytes)
         await self._send_telegram(settings, text, image_bytes)
 
-        # تعليم الكل كمُعلَن
         ids = [p["_id"] for p in pending]
         await self.col.update_many(
             {"_id": {"$in": ids}},
@@ -3579,7 +3722,6 @@ class AnnouncementQueue:
         base = f"https://api.telegram.org/bot{tg_token}"
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                # ملصق أولاً
                 try:
                     await session.post(f"{base}/sendSticker", json={
                         "chat_id": tg_chat_id,
@@ -3985,7 +4127,6 @@ class AnnouncementCog(commands.Cog):
         if not PILLOW_OK:
             return await ctx.send(embed=err_embed("Pillow غير مثبت", "قم بتشغيل: `pip install Pillow`"))
 
-        # جلب الجداول التسلسلية النشطة فقط
         db = db_client.get_database("rewyat_bot")
         schedules = await db.serial_schedules.find({"finished": False, "paused": False}).to_list(length=100)
         if not schedules:
@@ -4162,7 +4303,6 @@ async def main():
         log.critical(f"فشل الاتصال بـ MongoDB: {e}")
         return
 
-    # إنشاء الفهارس المطلوبة
     try:
         await db.serial_schedules.create_index("finished")
         await db.serial_schedules.create_index("paused")
@@ -4192,7 +4332,6 @@ async def main():
     await setup_announcement_system(bot, db)
     await bot.add_cog(ann_cog)
 
-    # تحميل خلفية الإعلان من الرابط
     async with aiohttp.ClientSession() as session:
         async with session.get("https://iili.io/C4oHOVS.png") as resp:
             if resp.status == 200:
@@ -4202,7 +4341,6 @@ async def main():
             else:
                 log.warning(f"فشل تحميل الخلفية، رمز الحالة: {resp.status}")
         
-        # ── إضافة: تحميل خط Amiri من Google ──
         async with session.get(ARABIC_FONT_URL) as resp2:
             if resp2.status == 200:
                 global ARABIC_FONT_BYTES
