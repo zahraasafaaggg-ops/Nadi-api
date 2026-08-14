@@ -599,6 +599,14 @@ def _serial_bar(done: int, total: int, width: int = 14) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {round(pct * 100)}%"
 
 
+def _is_duplicate_chapter_error(message: str) -> bool:
+    """يتعرف على خطأ الفصل الموجود مسبقاً حتى لا ندخل في إعادة محاولات بلا فائدة."""
+    normalized = unicodedata.normalize("NFKD", message or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    return "فصل" in normalized and "بهذا الرقم" in normalized and "مسبقا" in normalized
+
+
 async def run_serial_batch(serial_id: str):
     """تنفيذ دفعة النشر التسلسلي - تقرأ الجدول والفصول من MongoDB مباشرة."""
     await run_serial_batch_for_slot(serial_id)
@@ -617,6 +625,29 @@ async def _publish_with_serial_retry(api: NovelAPI, db, doc: dict, ch_data: dict
                 "number": ch_data["number"],
             })
             return True, msg
+        if _is_duplicate_chapter_error(msg):
+            await db.failed_serial_chapters.delete_one({
+                "serial_id": doc["_id"],
+                "number": ch_data["number"],
+            })
+            await db.duplicate_serial_chapters.update_one(
+                {"serial_id": doc["_id"], "number": ch_data["number"]},
+                {"$set": {
+                    "serial_id": doc["_id"],
+                    "slug": slug,
+                    "novel_arabic": doc.get("novel_arabic", ""),
+                    "number": ch_data["number"],
+                    "title": ch_data["title"],
+                    "message": msg[:500],
+                    "skipped_at": datetime.now(BAGHDAD_TZ).isoformat(),
+                }},
+                upsert=True
+            )
+            log.info(
+                f"[Serial] الفصل {ch_data['number']} موجود مسبقاً في {slug} — "
+                "تم تسجيله وتخطي إعادة المحاولة."
+            )
+            return True, "duplicate chapter skipped"
         if attempt < SERIAL_RETRY_ATTEMPTS:
             await asyncio.sleep(SERIAL_RETRY_BASE_DELAY * attempt)
 
