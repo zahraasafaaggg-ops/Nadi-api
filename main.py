@@ -681,7 +681,12 @@ def _serial_slots(doc: dict) -> List[dict]:
     }]
 
 
-async def run_serial_batch_for_slot(serial_id: str, slot: Optional[int] = None, manual_date: Optional[str] = None):
+async def run_serial_batch_for_slot(
+    serial_id: str,
+    slot: Optional[int] = None,
+    manual_date: Optional[str] = None,
+    auto_announce_check: bool = True,
+):
     """تنفيذ دفعة نشر تسلسلي لموعد محدد أو للموعد الوحيد."""
     db = db_client.get_database("rewyat_bot")
     doc = await db.serial_schedules.find_one({"_id": serial_id})
@@ -785,6 +790,7 @@ async def run_serial_batch_for_slot(serial_id: str, slot: Optional[int] = None, 
             last_chapter=last_published_num,
             cover_bytes=cover,
             source="serial",
+            auto_check=auto_announce_check,
         )
 
     # جلب القيم المحدثة لإرسال التقرير
@@ -2715,8 +2721,9 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
         slots = _serial_slots(doc)
         if len(slots) == 1:
             await i.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر دفعة **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING), view=None)
-            await run_serial_batch_for_slot(sid, slots[0]["slot"])
-            return await i.followup.send(embed=ok_embed("تم تنفيذ الأمر", "اكتمل طلب النشر التسلسلي اليدوي."))
+            await run_serial_batch_for_slot(sid, slots[0]["slot"], auto_announce_check=False)
+            announced = await ann_queue.announce_pending_now() if ann_queue else 0
+            return await i.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
         slot_view = discord.ui.View(timeout=60)
         for slot_doc in slots:
@@ -2728,8 +2735,9 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
                 if ii.user.id != interaction.user.id:
                     return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
                 await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** الآن.", Colors.WARNING), view=None)
-                await run_serial_batch_for_slot(sid, chosen_slot)
-                await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", "اكتمل طلب النشر التسلسلي اليدوي."))
+                await run_serial_batch_for_slot(sid, chosen_slot, auto_announce_check=False)
+                announced = await ann_queue.announce_pending_now() if ann_queue else 0
+                await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
             btn.callback = slot_cb
             slot_view.add_item(btn)
@@ -2739,8 +2747,9 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
             if ii.user.id != interaction.user.id:
                 return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
             await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين الآن.", Colors.WARNING), view=None)
-            await run_serial_batch_for_slot(sid, None)
-            await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", "اكتمل طلب النشر التسلسلي اليدوي."))
+            await run_serial_batch_for_slot(sid, None, auto_announce_check=False)
+            announced = await ann_queue.announce_pending_now() if ann_queue else 0
+            await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
         both_btn.callback = both_cb
         slot_view.add_item(both_btn)
         await i.response.edit_message(embed=make_embed("اختر الموعد", "هذا الجدول لديه أكثر من موعد. اختر ما تريد نشره الآن.", Colors.PURPLE), view=slot_view)
@@ -2769,8 +2778,9 @@ async def cmd_serial_publish_today_all(interaction: discord.Interaction):
         return await interaction.response.send_message(embed=warn_embed("لا توجد جداول نشطة"))
     await interaction.response.send_message(embed=make_embed("جارٍ نشر دفعة اليوم", f"سيتم تنفيذ **{len(docs)}** جدول تسلسلي الآن.", Colors.WARNING))
     for doc in docs:
-        await run_serial_batch_for_slot(doc["_id"], None)
-    await interaction.followup.send(embed=ok_embed("انتهى النشر اليدوي", f"تم تنفيذ دفعة اليوم لـ **{len(docs)}** جدول."))
+        await run_serial_batch_for_slot(doc["_id"], None, auto_announce_check=False)
+    announced = await ann_queue.announce_pending_now() if ann_queue else 0
+    await interaction.followup.send(embed=ok_embed("انتهى النشر اليدوي", f"تم تنفيذ دفعة اليوم لـ **{len(docs)}** جدول.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
 
 async def _retry_failed_doc(db, failed: dict) -> bool:
@@ -3352,6 +3362,7 @@ class AnnouncementQueue:
         last_chapter: int,
         cover_bytes: Optional[bytes] = None,
         source: str = "manual",
+        auto_check: bool = True,
     ):
         doc = {
             "novel_arabic":  novel_arabic,
@@ -3365,7 +3376,18 @@ class AnnouncementQueue:
         }
         await self.col.insert_one(doc)
         log.info(f"[Queue] سُجِّل: {novel_arabic} ف{first_chapter}-{last_chapter} ({source})")
-        asyncio.create_task(self._check_and_announce())
+        if auto_check:
+            asyncio.create_task(self._check_and_announce())
+
+    async def announce_pending_now(self) -> int:
+        """إعلان فوري لكل العناصر المعلقة، يُستخدم بعد أوامر النشر التسلسلي اليدوي."""
+        pending = await self.get_pending_entries()
+        if not pending:
+            return 0
+        if self._pending_recheck and not self._pending_recheck.done():
+            self._pending_recheck.cancel()
+        await self._fire_announcement(pending)
+        return len(pending)
 
     async def _check_and_announce(self):
         async with self._lock:
