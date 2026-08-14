@@ -774,10 +774,10 @@ async def run_serial_batch_for_slot(
 
     # تحديث عدد المنشورات بعدد الناجحين فقط (باستخدام $inc)
     if pub > 0:
-        await db.serial_schedules.update_one(
-            {"_id": serial_id},
-            {"$inc": {"published_count": pub}}
-        )
+        update_ops = {"$inc": {"published_count": pub}}
+        if manual_date:
+            update_ops["$set"] = {f"manual_publish_dates.{manual_date}": datetime.now(BAGHDAD_TZ).isoformat()}
+        await db.serial_schedules.update_one({"_id": serial_id}, update_ops)
         novel_store.inc_published(slug, pub)
 
     # إرسال إعلان إذا طلب ذلك وتم نشر شيء
@@ -2719,9 +2719,17 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
         if not doc:
             return await i.response.send_message(embed=err_embed("غير موجود"), ephemeral=True)
         slots = _serial_slots(doc)
+        today_key = _manual_serial_day_key()
+        needs_confirm = _serial_was_manually_published_today(doc)
         if len(slots) == 1:
-            await i.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر دفعة **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING), view=None)
-            await run_serial_batch_for_slot(sid, slots[0]["slot"], auto_announce_check=False)
+            if needs_confirm:
+                await i.response.defer()
+                if not await _confirm_publish_next_batch(i, doc.get("novel_arabic", sid)):
+                    return
+                await i.followup.send(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الدفعة التالية من **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING))
+            else:
+                await i.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر دفعة **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING), view=None)
+            await run_serial_batch_for_slot(sid, slots[0]["slot"], manual_date=today_key, auto_announce_check=False)
             announced = await ann_queue.announce_pending_now() if ann_queue else 0
             return await i.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
@@ -2734,8 +2742,15 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
             async def slot_cb(ii: discord.Interaction, chosen_slot=slot_doc["slot"]):
                 if ii.user.id != interaction.user.id:
                     return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-                await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** الآن.", Colors.WARNING), view=None)
-                await run_serial_batch_for_slot(sid, chosen_slot, auto_announce_check=False)
+                doc_current = await db.serial_schedules.find_one({"_id": sid}) or doc
+                if _serial_was_manually_published_today(doc_current):
+                    await ii.response.defer()
+                    if not await _confirm_publish_next_batch(ii, doc_current.get("novel_arabic", sid)):
+                        return
+                    await ii.followup.send(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** من الدفعة التالية الآن.", Colors.WARNING))
+                else:
+                    await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** الآن.", Colors.WARNING), view=None)
+                await run_serial_batch_for_slot(sid, chosen_slot, manual_date=_manual_serial_day_key(), auto_announce_check=False)
                 announced = await ann_queue.announce_pending_now() if ann_queue else 0
                 await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
@@ -2746,8 +2761,15 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
         async def both_cb(ii: discord.Interaction):
             if ii.user.id != interaction.user.id:
                 return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
-            await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين الآن.", Colors.WARNING), view=None)
-            await run_serial_batch_for_slot(sid, None, auto_announce_check=False)
+            doc_current = await db.serial_schedules.find_one({"_id": sid}) or doc
+            if _serial_was_manually_published_today(doc_current):
+                await ii.response.defer()
+                if not await _confirm_publish_next_batch(ii, doc_current.get("novel_arabic", sid)):
+                    return
+                await ii.followup.send(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين من الدفعة التالية الآن.", Colors.WARNING))
+            else:
+                await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين الآن.", Colors.WARNING), view=None)
+            await run_serial_batch_for_slot(sid, None, manual_date=_manual_serial_day_key(), auto_announce_check=False)
             announced = await ann_queue.announce_pending_now() if ann_queue else 0
             await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
         both_btn.callback = both_cb
@@ -2757,6 +2779,51 @@ async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[d
     sel.callback = sel_cb
     view.add_item(sel)
     await interaction.response.send_message(embed=make_embed(title, color=Colors.PURPLE), view=view)
+
+
+def _manual_serial_day_key() -> str:
+    return datetime.now(BAGHDAD_TZ).strftime("%Y-%m-%d")
+
+
+def _serial_was_manually_published_today(doc: dict) -> bool:
+    return bool(doc.get("manual_publish_dates", {}).get(_manual_serial_day_key()))
+
+
+async def _confirm_publish_next_batch(interaction: discord.Interaction, target_text: str) -> bool:
+    view = discord.ui.View(timeout=60)
+    result = {"ok": False}
+    yes_btn = discord.ui.Button(label="نعم، انشر الدفعة التالية", style=discord.ButtonStyle.success)
+    no_btn = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
+
+    async def yes_cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        result["ok"] = True
+        await i.response.edit_message(embed=make_embed("تم التأكيد", "سيتم نشر الدفعة التالية الآن.", Colors.WARNING), view=None)
+        view.stop()
+
+    async def no_cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        await i.response.edit_message(embed=warn_embed("تم الإلغاء", "لم يتم نشر أي دفعة إضافية."), view=None)
+        view.stop()
+
+    yes_btn.callback = yes_cb
+    no_btn.callback = no_cb
+    view.add_item(yes_btn)
+    view.add_item(no_btn)
+    await interaction.followup.send(
+        embed=make_embed(
+            "تنبيه: دفعة اليوم منشورة يدوياً",
+            f"تم تسجيل نشر يدوي سابق اليوم لـ **{target_text}**.\n"
+            "إذا أكدت الآن فلن أعيد نفس الفصول؛ سأنتقل إلى **الدفعة التالية** حسب ترتيب الفصول "
+            "(أي دفعة الغد عملياً إذا كانت دفعة اليوم اكتملت).",
+            Colors.WARNING
+        ),
+        view=view
+    )
+    await view.wait()
+    return result["ok"]
 
 
 @bot.tree.command(name="نشر_تسلسلي_الآن", description="نشر دفعة اليوم يدوياً الآن لجدول تسلسلي")
@@ -2777,8 +2844,17 @@ async def cmd_serial_publish_today_all(interaction: discord.Interaction):
     if not docs:
         return await interaction.response.send_message(embed=warn_embed("لا توجد جداول نشطة"))
     await interaction.response.send_message(embed=make_embed("جارٍ نشر دفعة اليوم", f"سيتم تنفيذ **{len(docs)}** جدول تسلسلي الآن.", Colors.WARNING))
+    already_manual = [d for d in docs if _serial_was_manually_published_today(d)]
+    if already_manual:
+        names = "، ".join(d.get("novel_arabic", d["_id"]) for d in already_manual[:10])
+        if len(already_manual) > 10:
+            names += f"، و{len(already_manual) - 10} أخرى"
+        if not await _confirm_publish_next_batch(interaction, names):
+            return
+        await interaction.followup.send(embed=make_embed("جارٍ نشر الدفعة التالية...", "تم التأكيد، سأكمل نشر الدفعة التالية للجداول المحددة.", Colors.WARNING))
+    today_key = _manual_serial_day_key()
     for doc in docs:
-        await run_serial_batch_for_slot(doc["_id"], None, auto_announce_check=False)
+        await run_serial_batch_for_slot(doc["_id"], None, manual_date=today_key, auto_announce_check=False)
     announced = await ann_queue.announce_pending_now() if ann_queue else 0
     await interaction.followup.send(embed=ok_embed("انتهى النشر اليدوي", f"تم تنفيذ دفعة اليوم لـ **{len(docs)}** جدول.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
 
@@ -3228,8 +3304,9 @@ class AnnouncementCanvas:
             raise ValueError("لا روايات")
 
         # ── حجم البطاقة حسب العدد ──
-        # 4 أعمدة حتى 8 روايات، و5 أعمدة لما يزيد عن ذلك، مع عدد أسطر مفتوح.
-        CARDS_PER_ROW = 5 if n > 8 else min(4, max(1, n))
+        # عدد الأعمدة يتدرّج مع كثرة الروايات بدلاً من رقم ثابت:
+        # 1-4 على صف واحد، 5-8 أربعة أعمدة، وبعدها يزيد تدريجياً كلما كثر العدد.
+        CARDS_PER_ROW = min(n, max(4, math.ceil(math.sqrt(n * 2)))) if n > 4 else max(1, n)
 
         if n == 1:
             cw, ch = 380, 560
@@ -3459,19 +3536,30 @@ class AnnouncementQueue:
         date_str = datetime.now(BAGHDAD_TZ).strftime("%Y/%m/%d")
         settings = await self._get_settings()
 
-        # أعد بناء قائمة الإدخالات مع الأغلفة
-        entries: List[Dict] = []
+        # أعد بناء قائمة الإدخالات مع الأغلفة، مع دمج نفس الرواية حتى لا تُرسم مرتين في Canvas
+        merged_entries: Dict[str, Dict] = {}
         for p in pending:
+            slug = p.get("slug", "")
             cover = p.get("cover_bytes")
             if not cover and ann_cog:
-                cover = await ann_cog.get_cover(p.get("slug", ""))
-            entries.append({
-                "novel_arabic":  p["novel_arabic"],
-                "slug":          p.get("slug", ""),
-                "first_chapter": p.get("first_chapter", p.get("last_chapter", 0)),
-                "last_chapter":  p.get("last_chapter", 0),
-                "cover_bytes":   cover,
-            })
+                cover = await ann_cog.get_cover(slug)
+            first_chapter = p.get("first_chapter", p.get("last_chapter", 0))
+            last_chapter = p.get("last_chapter", 0)
+            key = slug or p["novel_arabic"]
+            if key in merged_entries:
+                merged_entries[key]["first_chapter"] = min(merged_entries[key]["first_chapter"], first_chapter)
+                merged_entries[key]["last_chapter"] = max(merged_entries[key]["last_chapter"], last_chapter)
+                if cover and not merged_entries[key].get("cover_bytes"):
+                    merged_entries[key]["cover_bytes"] = cover
+            else:
+                merged_entries[key] = {
+                    "novel_arabic":  p["novel_arabic"],
+                    "slug":          slug,
+                    "first_chapter": first_chapter,
+                    "last_chapter":  last_chapter,
+                    "cover_bytes":   cover,
+                }
+        entries: List[Dict] = list(merged_entries.values())
 
         # تحديد source للنص: إذا وجد serial فهو serial، وإلا أكثر تكرار
         sources = [p.get("source", "manual") for p in pending]
