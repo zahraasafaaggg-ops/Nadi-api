@@ -9,6 +9,7 @@ import math
 import unicodedata
 import urllib.request
 import gzip
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
 
@@ -65,6 +66,8 @@ ARABIC_FONT_BYTES = None   # سيُخزن هنا بعد التحميل
 ARABIC_FONT_PATH = "/usr/share/fonts/opentype/unifont/unifont.otf"
 # فاصل وقت الانتظار بين الجداول التسلسلية المتقاربة (دقيقة)
 SERIAL_CLUSTER_WINDOW_MINUTES = 120
+SERIAL_RETRY_ATTEMPTS = 5
+SERIAL_RETRY_BASE_DELAY = 3
 
 # ══════════════════════════════════════════════════════════════
 #  ملصق تيليجرام
@@ -514,14 +517,15 @@ class RewayatBot(commands.Bot):
         async for doc in db.serial_schedules.find({"finished": False, "paused": False}):
             sid = doc["_id"]
             try:
-                scheduler.add_job(
-                    run_serial_batch,
-                    CronTrigger(hour=doc["hour"], minute=doc["minute"], timezone=BAGHDAD_TZ),
-                    args=[sid],
-                    id=f"serial_{sid}",
-                    replace_existing=True
-                )
-                serial_restored += 1
+                for slot_doc in _serial_slots(doc):
+                    scheduler.add_job(
+                        run_serial_batch_for_slot,
+                        CronTrigger(hour=slot_doc["hour"], minute=slot_doc["minute"], timezone=BAGHDAD_TZ),
+                        args=[sid, slot_doc["slot"]],
+                        id=f"serial_{sid}_{slot_doc['slot']}",
+                        replace_existing=True
+                    )
+                    serial_restored += 1
                 log.info(f"[Serial] استُعيد الجدول التسلسلي: {sid}")
             except Exception as e:
                 log.error(f"[Serial] فشل استعادة {sid}: {e}")
@@ -595,8 +599,95 @@ def _serial_bar(done: int, total: int, width: int = 14) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {round(pct * 100)}%"
 
 
+def _is_duplicate_chapter_error(message: str) -> bool:
+    """يتعرف على خطأ الفصل الموجود مسبقاً حتى لا ندخل في إعادة محاولات بلا فائدة."""
+    normalized = unicodedata.normalize("NFKD", message or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    return "فصل" in normalized and "بهذا الرقم" in normalized and "مسبقا" in normalized
+
+
 async def run_serial_batch(serial_id: str):
     """تنفيذ دفعة النشر التسلسلي - تقرأ الجدول والفصول من MongoDB مباشرة."""
+    await run_serial_batch_for_slot(serial_id)
+
+
+async def _publish_with_serial_retry(api: NovelAPI, db, doc: dict, ch_data: dict) -> Tuple[bool, str]:
+    """ينشر الفصل التسلسلي مع إعادة محاولة تلقائية وحفظ الفشل النهائي."""
+    slug = doc["slug"]
+    last_msg = ""
+    for attempt in range(1, SERIAL_RETRY_ATTEMPTS + 1):
+        ok, msg = await api.publish(slug, ch_data["number"], ch_data["title"], ch_data["content"])
+        last_msg = msg
+        if ok:
+            await db.failed_serial_chapters.delete_one({
+                "serial_id": doc["_id"],
+                "number": ch_data["number"],
+            })
+            return True, msg
+        if _is_duplicate_chapter_error(msg):
+            await db.failed_serial_chapters.delete_one({
+                "serial_id": doc["_id"],
+                "number": ch_data["number"],
+            })
+            await db.duplicate_serial_chapters.update_one(
+                {"serial_id": doc["_id"], "number": ch_data["number"]},
+                {"$set": {
+                    "serial_id": doc["_id"],
+                    "slug": slug,
+                    "novel_arabic": doc.get("novel_arabic", ""),
+                    "number": ch_data["number"],
+                    "title": ch_data["title"],
+                    "message": msg[:500],
+                    "skipped_at": datetime.now(BAGHDAD_TZ).isoformat(),
+                }},
+                upsert=True
+            )
+            log.info(
+                f"[Serial] الفصل {ch_data['number']} موجود مسبقاً في {slug} — "
+                "تم تسجيله وتخطي إعادة المحاولة."
+            )
+            return True, "duplicate chapter skipped"
+        if attempt < SERIAL_RETRY_ATTEMPTS:
+            await asyncio.sleep(SERIAL_RETRY_BASE_DELAY * attempt)
+
+    await db.failed_serial_chapters.update_one(
+        {"serial_id": doc["_id"], "number": ch_data["number"]},
+        {"$set": {
+            "serial_id": doc["_id"],
+            "slug": slug,
+            "novel_arabic": doc.get("novel_arabic", ""),
+            "number": ch_data["number"],
+            "title": ch_data["title"],
+            "content_compressed": Binary(gzip.compress(ch_data["content"].encode("utf-8"))),
+            "error": last_msg[:500],
+            "failed_at": datetime.now(BAGHDAD_TZ).isoformat(),
+            "attempts": SERIAL_RETRY_ATTEMPTS,
+        }},
+        upsert=True
+    )
+    return False, last_msg
+
+
+def _serial_slots(doc: dict) -> List[dict]:
+    slots = doc.get("slots")
+    if slots:
+        return slots
+    return [{
+        "slot": 1,
+        "hour": doc.get("hour", 0),
+        "minute": doc.get("minute", 0),
+        "size": doc.get("batch_size", 1),
+    }]
+
+
+async def run_serial_batch_for_slot(
+    serial_id: str,
+    slot: Optional[int] = None,
+    manual_date: Optional[str] = None,
+    auto_announce_check: bool = True,
+):
+    """تنفيذ دفعة نشر تسلسلي لموعد محدد أو للموعد الوحيد."""
     db = db_client.get_database("rewyat_bot")
     doc = await db.serial_schedules.find_one({"_id": serial_id})
     if not doc:
@@ -613,7 +704,9 @@ async def run_serial_batch(serial_id: str):
 
     published_count = doc.get("published_count", 0)
     total           = doc.get("total_chapters", 0)
-    batch_size      = doc.get("batch_size", 1)
+    slots           = _serial_slots(doc)
+    selected_slots  = [s for s in slots if slot is None or s.get("slot") == slot]
+    batch_size      = sum(max(0, int(s.get("size", 0))) for s in selected_slots) or doc.get("batch_size", 1)
 
     if published_count >= total:
         log.info(f"[Serial] انتهت فصول الجدول {serial_id}.")
@@ -665,7 +758,7 @@ async def run_serial_batch(serial_id: str):
     last_published_num  = None
 
     for ch_data in batch:
-        ok, _ = await api.publish(slug, ch_data["number"], ch_data["title"], ch_data["content"])
+        ok, _ = await _publish_with_serial_retry(api, db, doc, ch_data)
         if ok:
             pub += 1
             stats.record(True)
@@ -681,10 +774,10 @@ async def run_serial_batch(serial_id: str):
 
     # تحديث عدد المنشورات بعدد الناجحين فقط (باستخدام $inc)
     if pub > 0:
-        await db.serial_schedules.update_one(
-            {"_id": serial_id},
-            {"$inc": {"published_count": pub}}
-        )
+        update_ops = {"$inc": {"published_count": pub}}
+        if manual_date:
+            update_ops["$set"] = {f"manual_publish_dates.{manual_date}": datetime.now(BAGHDAD_TZ).isoformat()}
+        await db.serial_schedules.update_one({"_id": serial_id}, update_ops)
         novel_store.inc_published(slug, pub)
 
     # إرسال إعلان إذا طلب ذلك وتم نشر شيء
@@ -697,6 +790,7 @@ async def run_serial_batch(serial_id: str):
             last_chapter=last_published_num,
             cover_bytes=cover,
             source="serial",
+            auto_check=auto_announce_check,
         )
 
     # جلب القيم المحدثة لإرسال التقرير
@@ -706,9 +800,11 @@ async def run_serial_batch(serial_id: str):
     batches_left = max(0, (remaining + batch_size - 1) // batch_size)
     channel = bot.get_channel(doc["channel_id"])
     if channel:
+        slot_label = "كل المواعيد" if slot is None and len(slots) > 1 else (f"الموعد {slot}" if slot else "الموعد اليومي")
         nums_str = "، ".join(f"**{ch_data['number']}**" for ch_data in batch)
         embed = make_embed(
             f"دفعة جديدة — {doc.get('novel_arabic','')}",
+            f"**{slot_label}**\n"
             f"تم نشر الفصول: {nums_str}\n\n"
             f"`{_serial_bar(new_count, total)}`\n\n"
             f"المنشور: {new_count}/{total}  |  المتبقي: {remaining}  |  دفعات باقية: {batches_left}",
@@ -1670,8 +1766,9 @@ class SerialActionView(discord.ui.View):
         db = db_client.get_database("rewyat_bot")
         await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": True}})
         self.doc["paused"] = True
-        try: scheduler.pause_job(f"serial_{sid}")
-        except Exception: pass
+        for slot_doc in _serial_slots(self.doc):
+            try: scheduler.pause_job(f"serial_{sid}_{slot_doc['slot']}")
+            except Exception: pass
         self._build()
         await i.response.edit_message(embed=self._detail_embed(), view=self)
 
@@ -1682,11 +1779,13 @@ class SerialActionView(discord.ui.View):
         await db.serial_schedules.update_one({"_id": sid}, {"$set": {"paused": False}})
         self.doc["paused"] = False
         try:
-            scheduler.resume_job(f"serial_{sid}")
+            for slot_doc in _serial_slots(self.doc):
+                scheduler.resume_job(f"serial_{sid}_{slot_doc['slot']}")
         except Exception:
             try:
-                scheduler.add_job(run_serial_batch, CronTrigger(hour=self.doc["hour"], minute=self.doc["minute"], timezone=BAGHDAD_TZ),
-                                   args=[sid], id=f"serial_{sid}", replace_existing=True)
+                for slot_doc in _serial_slots(self.doc):
+                    scheduler.add_job(run_serial_batch_for_slot, CronTrigger(hour=slot_doc["hour"], minute=slot_doc["minute"], timezone=BAGHDAD_TZ),
+                                      args=[sid, slot_doc["slot"]], id=f"serial_{sid}_{slot_doc['slot']}", replace_existing=True)
             except Exception as e:
                 log.error(f"[Serial] فشل استئناف {sid}: {e}")
         self._build()
@@ -1699,8 +1798,10 @@ class SerialActionView(discord.ui.View):
         # حذف الجدول وجميع فصوله
         await db.serial_schedules.delete_one({"_id": sid})
         await db.serial_chapters.delete_many({"serial_id": sid})
-        try: scheduler.remove_job(f"serial_{sid}")
-        except Exception: pass
+        await db.failed_serial_chapters.delete_many({"serial_id": sid})
+        for slot_doc in _serial_slots(self.doc):
+            try: scheduler.remove_job(f"serial_{sid}_{slot_doc['slot']}")
+            except Exception: pass
         self.clear_items()
         await i.response.edit_message(
             embed=ok_embed("تم الحذف", f"تم حذف جدول **{self.doc.get('novel_arabic','الرواية')}** بنجاح."),
@@ -1756,6 +1857,8 @@ class SerialPublisher:
         self.batch_size:      int            = 1
         self.hour24:          int            = 10
         self.minute:          int            = 0
+        self.second_hour24:   Optional[int]  = None
+        self.second_minute:   Optional[int]  = None
         self.announce_enabled: bool          = True
 
     async def run(self):
@@ -1901,6 +2004,43 @@ class SerialPublisher:
             raise asyncio.TimeoutError()
         self.hour24 = time_view.hour24
         self.minute = time_view.minute
+        view = discord.ui.View(timeout=60)
+        chosen = {}
+        add_btn = discord.ui.Button(label="إضافة موعد ثانٍ اختياري", style=discord.ButtonStyle.primary, emoji="➕")
+        skip_btn = discord.ui.Button(label="وقت واحد فقط", style=discord.ButtonStyle.secondary)
+
+        async def add_cb(interaction: discord.Interaction):
+            if interaction.user.id != self.interaction.user.id:
+                return await interaction.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+            chosen["add"] = True
+            await interaction.response.edit_message(embed=inf_embed("اختيار الموعد الثاني", "اختر الموعد الثاني في الرسالة التالية."), view=None)
+            view.stop()
+
+        async def skip_cb(interaction: discord.Interaction):
+            if interaction.user.id != self.interaction.user.id:
+                return await interaction.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+            chosen["add"] = False
+            await interaction.response.edit_message(embed=ok_embed("وقت واحد", "سيتم نشر كامل الدفعة اليومية في موعد واحد."), view=None)
+            view.stop()
+
+        add_btn.callback = add_cb; skip_btn.callback = skip_cb
+        view.add_item(add_btn); view.add_item(skip_btn)
+        await self.interaction.followup.send(
+            embed=make_embed("موعد ثانٍ اختياري",
+                "هل تريد تقسيم دفعة اليوم على موعدين؟\n"
+                "إذا اخترت موعداً ثانياً سيُقسّم عدد الفصول اليومي بين الموعدين.",
+                Colors.PURPLE),
+            view=view
+        )
+        await view.wait()
+        if chosen.get("add"):
+            second_view = DailyTimePickerView(self.interaction.user.id)
+            await self.interaction.followup.send(embed=make_embed("اختر الموعد الثاني", color=Colors.PURPLE), view=second_view)
+            await second_view.wait()
+            if not second_view.done:
+                raise asyncio.TimeoutError()
+            self.second_hour24 = second_view.hour24
+            self.second_minute = second_view.minute
 
     async def _step_announce_option(self):
         novel_nm = self.novel["arabic"] if self.novel else self.slug
@@ -1947,6 +2087,16 @@ class SerialPublisher:
         batches = (total + self.batch_size - 1) // self.batch_size
         h12 = self.hour24 % 12 or 12
         per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+        time_text = f"**{h12:02d}:{self.minute:02d} {per_ar}** يومياً"
+        if self.second_hour24 is not None:
+            h12b = self.second_hour24 % 12 or 12
+            per_arb = "صباحاً" if self.second_hour24 < 12 else "مساءً"
+            first_size = (self.batch_size + 1) // 2
+            second_size = self.batch_size - first_size
+            time_text = (
+                f"الأول: **{h12:02d}:{self.minute:02d} {per_ar}** ({first_size} فصل)\n"
+                f"الثاني: **{h12b:02d}:{self.second_minute:02d} {per_arb}** ({second_size} فصل)"
+            )
 
         confirm_view = discord.ui.View(timeout=120)
         confirmed = {}
@@ -1994,7 +2144,7 @@ class SerialPublisher:
         embed.add_field(name="الرواية",          value=novel_nm,                                         inline=True)
         embed.add_field(name="إجمالي الفصول",    value=f"**{total}** فصل",                               inline=True)
         embed.add_field(name="الدفعة اليومية",   value=f"**{self.batch_size}** فصل/يوم",                  inline=True)
-        embed.add_field(name="وقت النشر",         value=f"**{h12:02d}:{self.minute:02d} {per_ar}** يومياً", inline=True)
+        embed.add_field(name="وقت النشر",         value=time_text, inline=True)
         embed.add_field(name="المدة التقريبية",   value=f"**{batches}** يوم",                             inline=True)
         embed.set_footer(text="اضغط 'بدء الجدول' للتأكيد أو 'معاينة الفصول' لمراجعتها")
 
@@ -2011,6 +2161,16 @@ class SerialPublisher:
         db = db_client.get_database("rewyat_bot")
 
         # 1. حفظ الجدول الأساسي
+        first_slot_size = self.batch_size
+        slots = [{"slot": 1, "hour": self.hour24, "minute": self.minute, "size": self.batch_size}]
+        if self.second_hour24 is not None:
+            first_slot_size = (self.batch_size + 1) // 2
+            second_slot_size = self.batch_size - first_slot_size
+            slots = [
+                {"slot": 1, "hour": self.hour24, "minute": self.minute, "size": first_slot_size},
+                {"slot": 2, "hour": self.second_hour24, "minute": self.second_minute, "size": second_slot_size},
+            ]
+
         schedule_doc = {
             "_id": serial_id,
             "slug": self.slug,
@@ -2021,6 +2181,7 @@ class SerialPublisher:
             "published_count": 0,
             "hour": self.hour24,
             "minute": self.minute,
+            "slots": slots,
             "channel_id": self.interaction.channel_id,
             "guild_id": self.interaction.guild_id if self.interaction.guild else None,
             "created_by": self.interaction.user.id,
@@ -2051,22 +2212,31 @@ class SerialPublisher:
             )
 
         # 3. جدولة المهمة
-        scheduler.add_job(
-            run_serial_batch,
-            CronTrigger(hour=self.hour24, minute=self.minute, timezone=BAGHDAD_TZ),
-            args=[serial_id],
-            id=f"serial_{serial_id}",
-            replace_existing=True
-        )
+        for slot_doc in slots:
+            scheduler.add_job(
+                run_serial_batch_for_slot,
+                CronTrigger(hour=slot_doc["hour"], minute=slot_doc["minute"], timezone=BAGHDAD_TZ),
+                args=[serial_id, slot_doc["slot"]],
+                id=f"serial_{serial_id}_{slot_doc['slot']}",
+                replace_existing=True
+            )
 
         total = len(self.chapters)
         batches = (total + self.batch_size - 1) // self.batch_size
         h12 = self.hour24 % 12 or 12
         per_ar = "صباحاً" if self.hour24 < 12 else "مساءً"
+        time_text = f"`{h12:02d}:{self.minute:02d} {per_ar}` يومياً"
+        if self.second_hour24 is not None:
+            h12b = self.second_hour24 % 12 or 12
+            per_arb = "صباحاً" if self.second_hour24 < 12 else "مساءً"
+            time_text = (
+                f"الأول: `{h12:02d}:{self.minute:02d} {per_ar}` ({slots[0]['size']} فصل)\n"
+                f"الثاني: `{h12b:02d}:{self.second_minute:02d} {per_arb}` ({slots[1]['size']} فصل)"
+            )
 
         success_embed = make_embed("تم إنشاء الجدول التسلسلي بنجاح!", color=Colors.SUCCESS)
         success_embed.description = f"سينشر البوت فصول **{novel_nm}** تلقائياً كل يوم.\n\n`{_serial_bar(0, total)}`"
-        success_embed.add_field(name="وقت النشر",      value=f"`{h12:02d}:{self.minute:02d} {per_ar}` يومياً", inline=True)
+        success_embed.add_field(name="وقت النشر",      value=time_text, inline=True)
         success_embed.add_field(name="الدفعة",         value=f"`{self.batch_size}` فصل/مرة",                    inline=True)
         success_embed.add_field(name="عدد الدفعات",    value=f"`{batches}` دفعة",                              inline=True)
         success_embed.add_field(name="إجمالي الفصول",  value=f"`{total}` فصل",                                  inline=True)
@@ -2348,6 +2518,7 @@ async def cmd_stats(interaction: discord.Interaction):
     serial_total = await db.serial_schedules.count_documents({})
     serial_active = await db.serial_schedules.count_documents({"finished": False, "paused": False})
     serial_finished = await db.serial_schedules.count_documents({"finished": True})
+    failed_serial = await db.failed_serial_chapters.count_documents({})
 
     await interaction.response.send_message(
         embed=make_embed("الإحصاءات", f"بوت النشر v{VERSION}", Colors.GOLD, fields=[
@@ -2359,6 +2530,7 @@ async def cmd_stats(interaction: discord.Interaction):
             {"name": "مهام عادية نشطة",   "value": f"`{len(jobs_db['jobs'])}` مهمة", "inline": True},
             {"name": "الروايات",          "value": f"`{len(novel_store.novels)}`",    "inline": True},
             {"name": "وقت التشغيل",      "value": f"`{h}h {m}m`",                   "inline": True},
+            {"name": "فصول تسلسلية فاشلة", "value": f"`{failed_serial}` فصل",        "inline": True},
             {"name": "جداول تسلسلية",    "value": f"نشطة: `{serial_active}` | مكتملة: `{serial_finished}` | الكل: `{serial_total}`", "inline": False},
         ])
     )
@@ -2524,6 +2696,231 @@ async def cmd_preview_serial(interaction: discord.Interaction):
         embed=make_embed("اختر الجدول للمعاينة", color=Colors.PURPLE),
         view=sel_view
     )
+
+
+async def _send_serial_now_picker(interaction: discord.Interaction, docs: List[dict], title: str):
+    view = discord.ui.View(timeout=90)
+    options = [
+        discord.SelectOption(
+            label=d.get("novel_arabic", "?")[:50],
+            value=d["_id"],
+            description=f"{d.get('published_count',0)}/{d.get('total_chapters',0)} فصل"
+        )
+        for d in docs[:25]
+    ]
+    sel = discord.ui.Select(placeholder="اختر جدولاً تسلسلياً...", options=options)
+
+    async def sel_cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        sid = i.data["values"][0]
+        db = db_client.get_database("rewyat_bot")
+        doc = await db.serial_schedules.find_one({"_id": sid})
+        if not doc:
+            return await i.response.send_message(embed=err_embed("غير موجود"), ephemeral=True)
+        slots = _serial_slots(doc)
+        today_key = _manual_serial_day_key()
+        needs_confirm = _serial_was_manually_published_today(doc)
+        if len(slots) == 1:
+            if needs_confirm:
+                await i.response.defer()
+                if not await _confirm_publish_next_batch(i, doc.get("novel_arabic", sid)):
+                    return
+                await i.followup.send(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الدفعة التالية من **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING))
+            else:
+                await i.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر دفعة **{doc.get('novel_arabic','')}** الآن.", Colors.WARNING), view=None)
+            await run_serial_batch_for_slot(sid, slots[0]["slot"], manual_date=today_key, auto_announce_check=False)
+            announced = await ann_queue.announce_pending_now() if ann_queue else 0
+            return await i.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
+
+        slot_view = discord.ui.View(timeout=60)
+        for slot_doc in slots:
+            h = slot_doc["hour"]; m = slot_doc["minute"]
+            h12 = h % 12 or 12; per_ar = "ص" if h < 12 else "م"
+            btn = discord.ui.Button(label=f"الموعد {slot_doc['slot']} ({h12:02d}:{m:02d} {per_ar})", style=discord.ButtonStyle.primary)
+
+            async def slot_cb(ii: discord.Interaction, chosen_slot=slot_doc["slot"]):
+                if ii.user.id != interaction.user.id:
+                    return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+                doc_current = await db.serial_schedules.find_one({"_id": sid}) or doc
+                if _serial_was_manually_published_today(doc_current):
+                    await ii.response.defer()
+                    if not await _confirm_publish_next_batch(ii, doc_current.get("novel_arabic", sid)):
+                        return
+                    await ii.followup.send(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** من الدفعة التالية الآن.", Colors.WARNING))
+                else:
+                    await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", f"سيتم نشر الموعد **{chosen_slot}** الآن.", Colors.WARNING), view=None)
+                await run_serial_batch_for_slot(sid, chosen_slot, manual_date=_manual_serial_day_key(), auto_announce_check=False)
+                announced = await ann_queue.announce_pending_now() if ann_queue else 0
+                await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
+
+            btn.callback = slot_cb
+            slot_view.add_item(btn)
+
+        both_btn = discord.ui.Button(label="نشر الموعدين معاً", style=discord.ButtonStyle.success)
+        async def both_cb(ii: discord.Interaction):
+            if ii.user.id != interaction.user.id:
+                return await ii.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+            doc_current = await db.serial_schedules.find_one({"_id": sid}) or doc
+            if _serial_was_manually_published_today(doc_current):
+                await ii.response.defer()
+                if not await _confirm_publish_next_batch(ii, doc_current.get("novel_arabic", sid)):
+                    return
+                await ii.followup.send(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين من الدفعة التالية الآن.", Colors.WARNING))
+            else:
+                await ii.response.edit_message(embed=make_embed("جارٍ النشر اليدوي...", "سيتم نشر الموعدين الآن.", Colors.WARNING), view=None)
+            await run_serial_batch_for_slot(sid, None, manual_date=_manual_serial_day_key(), auto_announce_check=False)
+            announced = await ann_queue.announce_pending_now() if ann_queue else 0
+            await ii.followup.send(embed=ok_embed("تم تنفيذ الأمر", f"اكتمل طلب النشر التسلسلي اليدوي.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
+        both_btn.callback = both_cb
+        slot_view.add_item(both_btn)
+        await i.response.edit_message(embed=make_embed("اختر الموعد", "هذا الجدول لديه أكثر من موعد. اختر ما تريد نشره الآن.", Colors.PURPLE), view=slot_view)
+
+    sel.callback = sel_cb
+    view.add_item(sel)
+    await interaction.response.send_message(embed=make_embed(title, color=Colors.PURPLE), view=view)
+
+
+def _manual_serial_day_key() -> str:
+    return datetime.now(BAGHDAD_TZ).strftime("%Y-%m-%d")
+
+
+def _serial_was_manually_published_today(doc: dict) -> bool:
+    return bool(doc.get("manual_publish_dates", {}).get(_manual_serial_day_key()))
+
+
+async def _confirm_publish_next_batch(interaction: discord.Interaction, target_text: str) -> bool:
+    view = discord.ui.View(timeout=60)
+    result = {"ok": False}
+    yes_btn = discord.ui.Button(label="نعم، انشر الدفعة التالية", style=discord.ButtonStyle.success)
+    no_btn = discord.ui.Button(label="إلغاء", style=discord.ButtonStyle.danger)
+
+    async def yes_cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        result["ok"] = True
+        await i.response.edit_message(embed=make_embed("تم التأكيد", "سيتم نشر الدفعة التالية الآن.", Colors.WARNING), view=None)
+        view.stop()
+
+    async def no_cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            return await i.response.send_message(embed=err_embed("غير مسموح"), ephemeral=True)
+        await i.response.edit_message(embed=warn_embed("تم الإلغاء", "لم يتم نشر أي دفعة إضافية."), view=None)
+        view.stop()
+
+    yes_btn.callback = yes_cb
+    no_btn.callback = no_cb
+    view.add_item(yes_btn)
+    view.add_item(no_btn)
+    await interaction.followup.send(
+        embed=make_embed(
+            "تنبيه: دفعة اليوم منشورة يدوياً",
+            f"تم تسجيل نشر يدوي سابق اليوم لـ **{target_text}**.\n"
+            "إذا أكدت الآن فلن أعيد نفس الفصول؛ سأنتقل إلى **الدفعة التالية** حسب ترتيب الفصول "
+            "(أي دفعة الغد عملياً إذا كانت دفعة اليوم اكتملت).",
+            Colors.WARNING
+        ),
+        view=view
+    )
+    await view.wait()
+    return result["ok"]
+
+
+@bot.tree.command(name="نشر_تسلسلي_الآن", description="نشر دفعة اليوم يدوياً الآن لجدول تسلسلي")
+@owner_only()
+async def cmd_serial_publish_now(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    docs = await db.serial_schedules.find({"finished": False, "paused": False}).to_list(length=50)
+    if not docs:
+        return await interaction.response.send_message(embed=warn_embed("لا توجد جداول نشطة"))
+    await _send_serial_now_picker(interaction, docs, "نشر تسلسلي يدوي الآن")
+
+
+@bot.tree.command(name="نشر_تسلسلي_دفعة_اليوم", description="نشر دفعة اليوم لكل الجداول التسلسلية النشطة الآن")
+@owner_only()
+async def cmd_serial_publish_today_all(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    docs = await db.serial_schedules.find({"finished": False, "paused": False}).to_list(length=200)
+    if not docs:
+        return await interaction.response.send_message(embed=warn_embed("لا توجد جداول نشطة"))
+    await interaction.response.send_message(embed=make_embed("جارٍ نشر دفعة اليوم", f"سيتم تنفيذ **{len(docs)}** جدول تسلسلي الآن.", Colors.WARNING))
+    already_manual = [d for d in docs if _serial_was_manually_published_today(d)]
+    if already_manual:
+        names = "، ".join(d.get("novel_arabic", d["_id"]) for d in already_manual[:10])
+        if len(already_manual) > 10:
+            names += f"، و{len(already_manual) - 10} أخرى"
+        if not await _confirm_publish_next_batch(interaction, names):
+            return
+        await interaction.followup.send(embed=make_embed("جارٍ نشر الدفعة التالية...", "تم التأكيد، سأكمل نشر الدفعة التالية للجداول المحددة.", Colors.WARNING))
+    today_key = _manual_serial_day_key()
+    for doc in docs:
+        await run_serial_batch_for_slot(doc["_id"], None, manual_date=today_key, auto_announce_check=False)
+    announced = await ann_queue.announce_pending_now() if ann_queue else 0
+    await interaction.followup.send(embed=ok_embed("انتهى النشر اليدوي", f"تم تنفيذ دفعة اليوم لـ **{len(docs)}** جدول.\nتم إرسال إعلان فوري لـ **{announced}** رواية."))
+
+
+async def _retry_failed_doc(db, failed: dict) -> bool:
+    try:
+        content = gzip.decompress(failed["content_compressed"]).decode("utf-8")
+    except Exception:
+        content = failed.get("content", "")
+    api = NovelAPI()
+    ok, msg = await api.publish(failed["slug"], failed["number"], failed.get("title", ""), content)
+    if ok:
+        await db.failed_serial_chapters.delete_one({"_id": failed["_id"]})
+    else:
+        await db.failed_serial_chapters.update_one({"_id": failed["_id"]}, {"$set": {"error": msg[:500], "failed_at": datetime.now(BAGHDAD_TZ).isoformat()}})
+    return ok
+
+
+@bot.tree.command(name="فصول_فاشلة", description="عرض الفصول التسلسلية الفاشلة")
+@owner_only()
+async def cmd_failed_chapters(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_serial_chapters.find({}).sort("failed_at", -1).to_list(length=100)
+    if not failed:
+        return await interaction.response.send_message(embed=ok_embed("لا توجد فصول فاشلة"))
+    groups: Dict[str, List[str]] = {}
+    for f in failed:
+        groups.setdefault(f.get("novel_arabic") or f.get("slug", "?"), []).append(str(f.get("number", "?")))
+    lines = [f"**{name}:** {', '.join(nums[:20])}" for name, nums in groups.items()]
+    await interaction.response.send_message(embed=make_embed("الفصول الفاشلة", "\n".join(lines)[:3900], Colors.WARNING))
+
+
+@bot.tree.command(name="اعادة_نشر_فصل", description="إعادة نشر فصل فاشل محدد")
+@owner_only()
+async def cmd_retry_failed_chapter(interaction: discord.Interaction, slug: str, number: int):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_serial_chapters.find_one({"slug": slug, "number": number})
+    if not failed:
+        return await interaction.response.send_message(embed=warn_embed("غير موجود", "لم أجد هذا الفصل ضمن الفصول الفاشلة."))
+    await interaction.response.defer()
+    ok = await _retry_failed_doc(db, failed)
+    await interaction.followup.send(embed=(ok_embed("تمت إعادة النشر") if ok else err_embed("فشلت إعادة النشر")))
+
+
+@bot.tree.command(name="اعادة_نشر_كل_فصول_رواية", description="إعادة نشر كل الفصول الفاشلة لرواية")
+@owner_only()
+async def cmd_retry_failed_novel(interaction: discord.Interaction, slug: str):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_serial_chapters.find({"slug": slug}).to_list(length=500)
+    await interaction.response.defer()
+    ok_count = 0
+    for f in failed:
+        ok_count += 1 if await _retry_failed_doc(db, f) else 0
+    await interaction.followup.send(embed=ok_embed("انتهت إعادة المحاولة", f"نجح **{ok_count}** من **{len(failed)}**."))
+
+
+@bot.tree.command(name="اعادة_نشر_كل_الفصول", description="إعادة نشر كل الفصول الفاشلة في النظام")
+@owner_only()
+async def cmd_retry_all_failed(interaction: discord.Interaction):
+    db = db_client.get_database("rewyat_bot")
+    failed = await db.failed_serial_chapters.find({}).to_list(length=1000)
+    await interaction.response.defer()
+    ok_count = 0
+    for f in failed:
+        ok_count += 1 if await _retry_failed_doc(db, f) else 0
+    await interaction.followup.send(embed=ok_embed("انتهت إعادة المحاولة", f"نجح **{ok_count}** من **{len(failed)}**."))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2907,7 +3304,9 @@ class AnnouncementCanvas:
             raise ValueError("لا روايات")
 
         # ── حجم البطاقة حسب العدد ──
-        CARDS_PER_ROW = 4 if n > 4 else max(1, n)
+        # عدد الأعمدة يتدرّج مع كثرة الروايات بدلاً من رقم ثابت:
+        # 1-4 على صف واحد، 5-8 أربعة أعمدة، وبعدها يزيد تدريجياً كلما كثر العدد.
+        CARDS_PER_ROW = min(n, max(4, math.ceil(math.sqrt(n * 2)))) if n > 4 else max(1, n)
 
         if n == 1:
             cw, ch = 380, 560
@@ -3040,6 +3439,7 @@ class AnnouncementQueue:
         last_chapter: int,
         cover_bytes: Optional[bytes] = None,
         source: str = "manual",
+        auto_check: bool = True,
     ):
         doc = {
             "novel_arabic":  novel_arabic,
@@ -3053,11 +3453,22 @@ class AnnouncementQueue:
         }
         await self.col.insert_one(doc)
         log.info(f"[Queue] سُجِّل: {novel_arabic} ف{first_chapter}-{last_chapter} ({source})")
-        asyncio.create_task(self._check_and_announce())
+        if auto_check:
+            asyncio.create_task(self._check_and_announce())
+
+    async def announce_pending_now(self) -> int:
+        """إعلان فوري لكل العناصر المعلقة، يُستخدم بعد أوامر النشر التسلسلي اليدوي."""
+        pending = await self.get_pending_entries()
+        if not pending:
+            return 0
+        if self._pending_recheck and not self._pending_recheck.done():
+            self._pending_recheck.cancel()
+        await self._fire_announcement(pending)
+        return len(pending)
 
     async def _check_and_announce(self):
         async with self._lock:
-            pending = await self.col.find({"announced": False}).to_list(length=100)
+            pending = await self.col.find({"announced": False}).to_list(length=1000)
             if not pending:
                 return
 
@@ -3097,10 +3508,7 @@ class AnnouncementQueue:
     async def _delayed_recheck(self, delay_seconds: float):
         try:
             await asyncio.sleep(max(30, delay_seconds))
-            async with self._lock:
-                pending = await self.col.find({"announced": False}).to_list(length=100)
-                if pending:
-                    await self._fire_announcement(pending)
+            await self._check_and_announce()
         except asyncio.CancelledError:
             log.info("[Queue] مهمة إعادة الفحص أُلغيت (جدول جديد سيتولى)")
 
@@ -3113,11 +3521,12 @@ class AnnouncementQueue:
             total     = doc.get("total_chapters", 0)
             if published >= total:
                 continue
-            h = doc.get("hour", 0); m = doc.get("minute", 0)
-            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            upcoming.append(candidate)
+            for slot_doc in _serial_slots(doc):
+                h = slot_doc.get("hour", 0); m = slot_doc.get("minute", 0)
+                candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if candidate <= now:
+                    candidate += timedelta(days=1)
+                upcoming.append(candidate)
         return upcoming
 
     async def _fire_announcement(self, pending: list):
@@ -3127,19 +3536,30 @@ class AnnouncementQueue:
         date_str = datetime.now(BAGHDAD_TZ).strftime("%Y/%m/%d")
         settings = await self._get_settings()
 
-        # أعد بناء قائمة الإدخالات مع الأغلفة
-        entries: List[Dict] = []
+        # أعد بناء قائمة الإدخالات مع الأغلفة، مع دمج نفس الرواية حتى لا تُرسم مرتين في Canvas
+        merged_entries: Dict[str, Dict] = {}
         for p in pending:
+            slug = p.get("slug", "")
             cover = p.get("cover_bytes")
             if not cover and ann_cog:
-                cover = await ann_cog.get_cover(p.get("slug", ""))
-            entries.append({
-                "novel_arabic":  p["novel_arabic"],
-                "slug":          p.get("slug", ""),
-                "first_chapter": p.get("first_chapter", p.get("last_chapter", 0)),
-                "last_chapter":  p.get("last_chapter", 0),
-                "cover_bytes":   cover,
-            })
+                cover = await ann_cog.get_cover(slug)
+            first_chapter = p.get("first_chapter", p.get("last_chapter", 0))
+            last_chapter = p.get("last_chapter", 0)
+            key = slug or p["novel_arabic"]
+            if key in merged_entries:
+                merged_entries[key]["first_chapter"] = min(merged_entries[key]["first_chapter"], first_chapter)
+                merged_entries[key]["last_chapter"] = max(merged_entries[key]["last_chapter"], last_chapter)
+                if cover and not merged_entries[key].get("cover_bytes"):
+                    merged_entries[key]["cover_bytes"] = cover
+            else:
+                merged_entries[key] = {
+                    "novel_arabic":  p["novel_arabic"],
+                    "slug":          slug,
+                    "first_chapter": first_chapter,
+                    "last_chapter":  last_chapter,
+                    "cover_bytes":   cover,
+                }
+        entries: List[Dict] = list(merged_entries.values())
 
         # تحديد source للنص: إذا وجد serial فهو serial، وإلا أكثر تكرار
         sources = [p.get("source", "manual") for p in pending]
@@ -3243,7 +3663,7 @@ class AnnouncementQueue:
         return await self.col.count_documents({"announced": False})
 
     async def get_pending_entries(self) -> List[dict]:
-        return await self.col.find({"announced": False}).to_list(length=100)
+        return await self.col.find({"announced": False}).to_list(length=1000)
 
     async def clear_pending(self):
         await self.col.update_many(
@@ -3621,17 +4041,17 @@ class AnnouncementCog(commands.Cog):
                     "cover_bytes":   cover,
                 })
         else:
-            novels_doc = await self.db.config.find_one({"_id": "novels"})
-            novels = (novels_doc.get("data", {}).get("novels", []) if novels_doc else [])
+            serial_docs = await self.db.serial_schedules.find({"finished": False, "paused": False}).to_list(length=100)
             entries = []
-            for n in novels[:8]:
+            for n in serial_docs:
                 cover = await self.get_cover(n["slug"])
                 pc = n.get("published_count", 0)
+                batch = n.get("batch_size", 1)
                 entries.append({
-                    "novel_arabic":  n["arabic"],
+                    "novel_arabic":  n.get("novel_arabic", n["slug"]),
                     "slug":          n["slug"],
-                    "first_chapter": max(1, pc - 5),
-                    "last_chapter":  pc,
+                    "first_chapter": pc + 1,
+                    "last_chapter":  min(n.get("total_chapters", pc + batch), pc + batch),
                     "cover_bytes":   cover,
                 })
             if not entries:
