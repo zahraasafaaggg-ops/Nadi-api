@@ -681,13 +681,39 @@ def _serial_slots(doc: dict) -> List[dict]:
     }]
 
 
+async def sync_serial_with_site(db, serial_id: str, api, slug: str) -> int:
+    """تستعلم من API الموقع عن آخر فصل منشور فعلياً لهذه الرواية."""
+    try:
+        url = f"https://rewayat.club/api/novels/{slug}/chapters/"
+        headers = api._headers
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.get(url, headers=headers) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    chapters = data.get("results", data) if isinstance(data, dict) else data
+                    if isinstance(chapters, list) and chapters:
+                        max_num = 0
+                        for ch in chapters:
+                            num = ch.get("number", 0)
+                            if isinstance(num, (int, float)) and num > max_num:
+                                max_num = int(num)
+                        log.info(f"[Sync] آخر فصل على الموقع للرواية {slug}: {max_num}")
+                        return max_num
+                else:
+                    log.warning(f"[Sync] فشل جلب فصول {slug} [{r.status}]")
+    except Exception as e:
+        log.error(f"[Sync] خطأ مزامنة {slug}: {e}")
+    return 0
+
+
 async def run_serial_batch_for_slot(
     serial_id: str,
     slot: Optional[int] = None,
     manual_date: Optional[str] = None,
     auto_announce_check: bool = True,
 ):
-    """تنفيذ دفعة نشر تسلسلي لموعد محدد أو للموعد الوحيد."""
+    """تنفيذ دفعة نشر تسلسلي لموعد محدد أو للموعد الوحيد - النسخة المصححة."""
     db = db_client.get_database("rewyat_bot")
     doc = await db.serial_schedules.find_one({"_id": serial_id})
     if not doc:
@@ -702,13 +728,22 @@ async def run_serial_batch_for_slot(
         log.info(f"[Serial] الجدول {serial_id} متوقف، تخطي.")
         return
 
-    published_count = doc.get("published_count", 0)
     total           = doc.get("total_chapters", 0)
     slots           = _serial_slots(doc)
     selected_slots  = [s for s in slots if slot is None or s.get("slot") == slot]
     batch_size      = sum(max(0, int(s.get("size", 0))) for s in selected_slots) or doc.get("batch_size", 1)
+    published_count = doc.get("published_count", 0)
+    
+    # الحقل الجديد: آخر رقم فصل تم التعامل معه (ناجح/فاشل/متخطى)
+    last_processed = doc.get("last_processed_number", published_count)
 
-    if published_count >= total:
+    # شرط الانتهاء بناءً على last_processed_number
+    remaining_cursor = db.serial_chapters.find(
+        {"serial_id": serial_id, "number": {"$gt": last_processed}}
+    ).limit(1)
+    has_remaining = await remaining_cursor.to_list(length=1)
+    
+    if not has_remaining:
         log.info(f"[Serial] انتهت فصول الجدول {serial_id}.")
         try:
             scheduler.remove_job(f"serial_{serial_id}")
@@ -721,24 +756,23 @@ async def run_serial_batch_for_slot(
         ch = bot.get_channel(doc["channel_id"])
         if ch:
             await ch.send(embed=make_embed(
-                "انتهت جميع فصول الجدول",
-                f"**{doc.get('novel_arabic','الرواية')}** — تم نشر جميع الـ {total} فصل بنجاح.\n"
+                "✅ انتهت جميع فصول الجدول",
+                f"**{doc.get('novel_arabic','الرواية')}** — تم نشر جميع الـ {total} فصل.\n"
                 f"يمكنك رفع رواية جديدة باستخدام `/نشر_تسلسلي`",
                 Colors.GOLD
             ))
         return
 
-    # جلب الفصول التالية من serial_chapters
+    # جلب الفصول التالية باستخدام last_processed_number بدلاً من published_count
     chapters_cursor = db.serial_chapters.find(
-        {"serial_id": serial_id, "number": {"$gt": published_count}}
+        {"serial_id": serial_id, "number": {"$gt": last_processed}}
     ).sort("number", 1).limit(batch_size)
     batch = []
     async for ch in chapters_cursor:
-        # فك ضغط المحتوى
         try:
             content = gzip.decompress(ch["content_compressed"]).decode("utf-8")
         except Exception:
-            content = ch.get("content", "")   # fallback (لن يكون موجوداً)
+            content = ch.get("content", "")
         batch.append({
             "number": ch["number"],
             "title": ch["title"],
@@ -746,39 +780,59 @@ async def run_serial_batch_for_slot(
         })
 
     if not batch:
-        # لا توجد فصول (ربما بسبب مشكلة في الفهرس)
-        log.warning(f"[Serial] لم يُعثر على فصول للجدول {serial_id} رغم published_count {published_count}")
+        log.warning(f"[Serial] لم يُعثر على فصول للجدول {serial_id} بعد الرقم {last_processed}")
         return
 
     api   = NovelAPI()
     slug  = doc["slug"]
     pub   = 0
+    skipped = 0
     fail  = 0
     first_published_num = None
     last_published_num  = None
+    new_last_processed = last_processed
 
     for ch_data in batch:
-        ok, _ = await _publish_with_serial_retry(api, db, doc, ch_data)
+        ch_num = ch_data["number"]
+        ok, response_text = await _publish_with_serial_retry(api, db, doc, ch_data)
         if ok:
-            pub += 1
-            stats.record(True)
-            account_manager.record_publish(True)
-            if first_published_num is None:
-                first_published_num = ch_data["number"]
-            last_published_num = ch_data["number"]
+            # تحقق هل كان تخطي أم نشر حقيقي
+            if response_text == "duplicate chapter skipped":
+                skipped += 1
+                stats.record(True)
+                account_manager.record_publish(True)
+                log.info(f"[Serial] ⏭️ الفصل {ch_num} موجود مسبقاً في {slug} — تم تخطيه")
+            else:
+                pub += 1
+                stats.record(True)
+                account_manager.record_publish(True)
+                if first_published_num is None:
+                    first_published_num = ch_num
+                last_published_num = ch_num
+                log.info(f"[Serial] ✅ نُشر الفصل {ch_num} من {slug}")
         else:
             fail += 1
             stats.record(False)
             account_manager.record_publish(False)
+            log.warning(f"[Serial] ❌ فشل نشر الفصل {ch_num} من {slug}: {response_text[:200]}")
+        
+        # تحديث المؤشر دائماً بغض النظر عن النتيجة
+        new_last_processed = max(new_last_processed, ch_num)
         await asyncio.sleep(1.0)
 
-    # تحديث عدد المنشورات بعدد الناجحين فقط (باستخدام $inc)
+    # تحديث قاعدة البيانات
+    update_fields = {"last_processed_number": new_last_processed}
     if pub > 0:
-        update_ops = {"$inc": {"published_count": pub}}
+        update_ops = {"$set": update_fields, "$inc": {"published_count": pub}}
         if manual_date:
-            update_ops["$set"] = {f"manual_publish_dates.{manual_date}": datetime.now(BAGHDAD_TZ).isoformat()}
+            update_ops["$set"][f"manual_publish_dates.{manual_date}"] = datetime.now(BAGHDAD_TZ).isoformat()
         await db.serial_schedules.update_one({"_id": serial_id}, update_ops)
         novel_store.inc_published(slug, pub)
+    else:
+        await db.serial_schedules.update_one(
+            {"_id": serial_id},
+            {"$set": update_fields}
+        )
 
     # إرسال إعلان إذا طلب ذلك وتم نشر شيء
     if pub > 0 and ann_queue is not None and last_published_num is not None and doc.get("announce_enabled", True):
@@ -2154,11 +2208,28 @@ class SerialPublisher:
             raise asyncio.TimeoutError()
 
     async def _step_create_schedule(self):
-        """يحفظ الجدول والفصول في MongoDB مع ضغط المحتوى باستخدام gzip و Binary."""
+        """يحفظ الجدول والفصول في MongoDB مع ضغط المحتوى ومزامنة نقطة البداية."""
         novel_nm = self.novel["arabic"] if self.novel else self.slug
         serial_id = f"serial_{self.interaction.user.id}_{int(datetime.utcnow().timestamp())}"
 
         db = db_client.get_database("rewyat_bot")
+
+        # ── 0. مزامنة نقطة البداية مع الموقع (الإصلاح الجذري) ──
+        api = NovelAPI()
+        site_max_chapter = await sync_serial_with_site(db, serial_id, api, self.slug)
+        
+        # تحديد أول رقم فصل في الملف المرفوع
+        file_min_chapter = min(ch["number"] for ch in self.chapters) if self.chapters else 1
+        
+        # last_processed_number = أعلى قيمة بين:
+        #   - آخر فصل موجود على الموقع (لتخطي الفصول المنشورة مسبقاً)
+        #   - أول فصل في الملف - 1 (لضمان البدء من بداية الملف إذا كان الموقع فارغاً)
+        initial_last_processed = max(site_max_chapter, file_min_chapter - 1)
+        
+        log.info(
+            f"[Serial Init] {novel_nm}: site_max={site_max_chapter}, "
+            f"file_min={file_min_chapter}, last_processed={initial_last_processed}"
+        )
 
         # 1. حفظ الجدول الأساسي
         first_slot_size = self.batch_size
@@ -2179,6 +2250,7 @@ class SerialPublisher:
             "batch_size": self.batch_size,
             "total_chapters": len(self.chapters),
             "published_count": 0,
+            "last_processed_number": initial_last_processed,  # ← الحقل الجديد!
             "hour": self.hour24,
             "minute": self.minute,
             "slots": slots,
